@@ -1,6 +1,23 @@
 import numpy as np
 
 class SimData:
+    def __init__(self, data=None, q=0):
+        """
+        初始化SimData对象
+        Args:
+            data: numpy数组数据
+            q: 量化位移，表示 int8_value = float_value * 2^q，scale = 2^q
+        """
+        self.data = data
+        self.q = q
+        self.scale = 2 ** q  # scale = 2^q
+    
+    def __repr__(self):
+        """String representation for debugging"""
+        if self.data is not None:
+            return f"SimData(shape={self.data.shape}, q={self.q}, scale={self.scale:.6f}, range=[{np.min(self.data):.2f}, {np.max(self.data):.2f}])"
+        return f"SimData(data=None, q={self.q}, scale={self.scale:.6f})"
+
     @staticmethod
     def quantize_to_int8(data, scale=None):
         """
@@ -44,7 +61,7 @@ class SimData:
         return quantized_data.astype(np.float32) / scale
     
     @staticmethod
-    def load_data_from_binary(file_path, n_channels, height, width, scale=1.0):
+    def load_data_from_binary(file_path, n_channels, height, width, q=0):
         """
         从二进制文件加载输入数据
         文件格式: binary (int8, 量化范围 -127 ~ 127)
@@ -56,10 +73,10 @@ class SimData:
             n_channels: 通道数
             height: 高度
             width: 宽度
-            scale: 反量化比例因子
+            q: 量化位移，scale = 2^q
         
         Returns:
-            numpy数组，形状为 (1, n_channels, height, width)
+            SimData对象，包含数据和q信息
         """
         try:
             # 读取二进制文件 (int8格式)
@@ -70,17 +87,15 @@ class SimData:
             if len(data_flat) != expected_size:
                 raise ValueError(f"数据文件大小不匹配。期望 {expected_size} 个值，实际得到 {len(data_flat)} 个值")
             
-            # 反量化到浮点数
-            data_flat = SimData.dequantize_from_int8(data_flat, scale)
-            
+            # 保持int8格式（不反量化），因为我们在int8域计算
             # 重塑为正确的形状: [n_channel, height, width]
             data = data_flat.reshape(n_channels, height, width)
             
             # 添加batch维度，返回 (1, n_channels, height, width)
-            data = np.expand_dims(data, axis=0)
+            data = np.expand_dims(data, axis=0).astype(np.float32)
             
-            print(f"成功从二进制文件加载数据: {file_path}, 形状: {data.shape}")
-            return data
+            print(f"成功从二进制文件加载数据: {file_path}, 形状: {data.shape}, q={q}, scale={2**q}")
+            return SimData(data=data, q=q)
             
         except Exception as e:
             print(f"加载二进制数据文件失败: {e}")
@@ -158,15 +173,16 @@ class SimData:
         return data
 
 class ConvLayer:
-    def __init__(self, input_channels, output_channels, kernel_size, stride=1, padding=0, requant_shift=9):
+    def __init__(self, input_channels, output_channels, kernel_size, stride=1, padding=0):
         self.input_channels = input_channels
         self.output_channels = output_channels
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
-        self.requant_shift = requant_shift  # Requantization右移位数
         self.weights = np.random.randn(output_channels, input_channels, kernel_size, kernel_size) * 0.01
         self.bias = np.zeros((output_channels, 1))
+        self.weight_q = 0  # 权重的量化位移
+        self.weight_scale = 1.0  # 权重的量化比例因子 = 2^weight_q
     
     def load_weights_from_text(self, file_path):
         """
@@ -195,7 +211,7 @@ class ConvLayer:
             print(f"加载文本权重文件失败: {e}")
             raise
     
-    def load_weights_from_binary(self, file_path, scale=1.0):
+    def load_weights_from_binary(self, file_path, q=0):
         """
         从二进制文件加载权重
         文件格式: binary (int8, 量化范围 -127 ~ 127)
@@ -204,7 +220,7 @@ class ConvLayer:
         
         Args:
             file_path: 二进制权重文件路径
-            scale: 反量化比例因子
+            q: 量化位移，scale = 2^q
         """
         try:
             # 读取二进制文件 (int8格式)
@@ -215,12 +231,14 @@ class ConvLayer:
             if len(weights_flat) != expected_size:
                 raise ValueError(f"权重文件大小不匹配。期望 {expected_size} 个值，实际得到 {len(weights_flat)} 个值")
             
-            # 反量化到浮点数
-            weights_flat = SimData.dequantize_from_int8(weights_flat, scale)
+            # 保持int8格式（存储为float32但值是int8范围）
+            weights_flat = weights_flat.astype(np.float32)
             
             # 重塑为正确的形状
             self.weights = weights_flat.reshape(self.output_channels, self.input_channels, self.kernel_size, self.kernel_size)
-            print(f"成功从二进制文件加载权重: {file_path}, 量化比例: {scale}")
+            self.weight_q = q  # 保存权重的量化位移
+            self.weight_scale = 2 ** q  # 计算量化比例因子
+            print(f"成功从二进制文件加载权重: {file_path}, q={q}, scale={self.weight_scale}")
             
         except Exception as e:
             print(f"加载二进制权重文件失败: {e}")
@@ -267,18 +285,27 @@ class ConvLayer:
             print(f"保存二进制权重文件失败: {e}")
             raise
 
-    def forward(self, input_data):
+    def forward(self, input_simdata, output_q=0):
         """
         在int8域进行卷积计算，模拟硬件行为
-        假设输入和权重都已经是int8量化后的值
-        累加后右移9位进行requantization
+        自动根据输入、权重、输出的量化精度计算requant_shift
         
         Args:
-            input_data: int8量化后的输入数据
+            input_simdata: SimData对象，包含int8量化后的输入数据和q
+            output_q: 期望的输出量化位移，output_scale = 2^output_q
         
         Returns:
-            int8量化后的输出数据
+            SimData对象，包含int8量化后的输出数据和q
         """
+        input_data = input_simdata.data
+        input_q = input_simdata.q
+        
+        # 计算requant_shift
+        requant_shift = input_q + self.weight_q - output_q
+        
+        # print(f"  [ConvLayer] input_q={input_q}, weight_q={self.weight_q}, output_q={output_q}")
+        # print(f"  [ConvLayer] 计算得到 requant_shift={requant_shift}")
+        
         batch_size, in_channels, in_height, in_width = input_data.shape
         out_height = (in_height - self.kernel_size + 2 * self.padding) // self.stride + 1
         out_width = (in_width - self.kernel_size + 2 * self.padding) // self.stride + 1
@@ -317,20 +344,21 @@ class ConvLayer:
                         acc += bias_int8[oc, 0]
                         
                         # Requantization: 右移指定位数
-                        acc = acc >> self.requant_shift
+                        acc = acc >> requant_shift
                         
                         # clip到int8范围 [-127, 127]
                         output_data[b, oc, oh, ow] = np.float32(np.clip(acc, -127, 127))
         
-        return output_data
+        return SimData(data=output_data, q=output_q)
 
 class FcLayer:
-    def __init__(self, input_size, output_size, requant_shift=9):
+    def __init__(self, input_size, output_size):
         self.input_size = input_size
         self.output_size = output_size
-        self.requant_shift = requant_shift  # Requantization右移位数
         self.weights = np.random.randn(output_size, input_size) * 0.01
         self.bias = np.zeros((output_size, 1))
+        self.weight_q = 0  # 权重的量化位移
+        self.weight_scale = 1.0  # 权重的量化比例因子 = 2^weight_q
     
     def load_weights_from_text(self, file_path):
         """
@@ -359,7 +387,7 @@ class FcLayer:
             print(f"加载文本权重文件失败: {e}")
             raise
     
-    def load_weights_from_binary(self, file_path, scale=1.0):
+    def load_weights_from_binary(self, file_path, q=0):
         """
         从二进制文件加载权重
         文件格式: binary (int8, 量化范围 -127 ~ 127)
@@ -368,7 +396,7 @@ class FcLayer:
         
         Args:
             file_path: 二进制权重文件路径
-            scale: 反量化比例因子
+            q: 量化位移，scale = 2^q
         """
         try:
             # 读取二进制文件 (int8格式)
@@ -379,12 +407,14 @@ class FcLayer:
             if len(weights_flat) != expected_size:
                 raise ValueError(f"权重文件大小不匹配。期望 {expected_size} 个值，实际得到 {len(weights_flat)} 个值")
             
-            # 反量化到浮点数
-            weights_flat = SimData.dequantize_from_int8(weights_flat, scale)
+            # 保持int8格式（存储为float32但值是int8范围）
+            weights_flat = weights_flat.astype(np.float32)
             
             # 重塑为正确的形状
             self.weights = weights_flat.reshape(self.output_size, self.input_size)
-            print(f"成功从二进制文件加载权重: {file_path}, 量化比例: {scale}")
+            self.weight_q = q  # 保存权重的量化位移
+            self.weight_scale = 2 ** q  # 计算量化比例因子
+            print(f"成功从二进制文件加载权重: {file_path}, q={q}, scale={self.weight_scale}")
             
         except Exception as e:
             print(f"加载二进制权重文件失败: {e}")
@@ -431,18 +461,35 @@ class FcLayer:
             print(f"保存二进制权重文件失败: {e}")
             raise
     
-    def forward(self, input_data):
+    def forward(self, input_simdata, output_q=0):
         """
         在int8域进行全连接层计算，模拟硬件行为
-        假设输入和权重都已经是int8量化后的值
+        自动根据输入、权重、输出的量化精度计算requant_shift
         
         Args:
-            input_data: int8量化后的输入数据
+            input_simdata: SimData对象，包含int8量化后的输入数据和q
+                          可以是4D (batch, channels, h, w) 或 2D (batch, features)
+            output_q: 期望的输出量化位移，output_scale = 2^output_q
         
         Returns:
-            int8量化后的输出数据
+            SimData对象，包含int8量化后的输出数据和q
         """
+        input_data = input_simdata.data
+        input_q = input_simdata.q
+        
+        # 如果输入是4D，展平为2D
+        if input_data.ndim == 4:
+            batch_size = input_data.shape[0]
+            input_data = input_data.reshape(batch_size, -1)
+        
         batch_size = input_data.shape[0]
+        
+        # 计算requant_shift
+        # requant_shift = input_q + weight_q - output_q
+        requant_shift = input_q + self.weight_q - output_q
+        
+        print(f"  [FcLayer] input_q={input_q}, weight_q={self.weight_q}, output_q={output_q}")
+        print(f"  [FcLayer] 计算得到 requant_shift={requant_shift}")
         
         # 转换为int8
         input_int8 = np.round(input_data).astype(np.int8)
@@ -464,9 +511,9 @@ class FcLayer:
                 acc += bias_int8[o, 0]
                 
                 # Requantization: 右移指定位数
-                acc = acc >> self.requant_shift
+                acc = acc >> requant_shift
                 
                 # clip到int8范围 [-127, 127]
                 output_data[b, o] = np.float32(np.clip(acc, -127, 127))
         
-        return output_data
+        return SimData(data=output_data, q=output_q)

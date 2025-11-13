@@ -34,18 +34,18 @@ def layers():
     conv4.load_weights_from_text(str(PARAM_DIR / "conv4.real.dat"))
     fc.load_weights_from_text(str(PARAM_DIR / "fc.real.dat"))
 
-    # Int8 quantized layers
-    conv1_int8 = ConvLayer(input_channels=1, output_channels=32, kernel_size=5, stride=1, padding=2, requant_shift=9)
-    conv2_int8 = ConvLayer(input_channels=32, output_channels=64, kernel_size=3, stride=1, padding=1, requant_shift=8)
-    conv3_int8 = ConvLayer(input_channels=64, output_channels=64, kernel_size=3, stride=2, padding=1, requant_shift=8)
-    conv4_int8 = ConvLayer(input_channels=64, output_channels=128, kernel_size=3, stride=2, padding=1, requant_shift=8)
-    fc_int8 = FcLayer(input_size=128, output_size=10, requant_shift=6)
+    # Int8 quantized layers (no requant_shift in constructor)
+    conv1_int8 = ConvLayer(input_channels=1, output_channels=32, kernel_size=5, stride=1, padding=2)
+    conv2_int8 = ConvLayer(input_channels=32, output_channels=64, kernel_size=3, stride=1, padding=1)
+    conv3_int8 = ConvLayer(input_channels=64, output_channels=64, kernel_size=3, stride=2, padding=1)
+    conv4_int8 = ConvLayer(input_channels=64, output_channels=128, kernel_size=3, stride=2, padding=1)
+    fc_int8 = FcLayer(input_size=128, output_size=10)
 
-    conv1_int8.load_weights_from_binary(str(PARAM_DIR / "conv1.dat"), scale=1.0)
-    conv2_int8.load_weights_from_binary(str(PARAM_DIR / "conv2.dat"), scale=1.0)
-    conv3_int8.load_weights_from_binary(str(PARAM_DIR / "conv3.dat"), scale=1.0)
-    conv4_int8.load_weights_from_binary(str(PARAM_DIR / "conv4.dat"), scale=1.0)
-    fc_int8.load_weights_from_binary(str(PARAM_DIR / "fc.dat"), scale=1.0)
+    conv1_int8.load_weights_from_binary(str(PARAM_DIR / "conv1.dat"), q=7)
+    conv2_int8.load_weights_from_binary(str(PARAM_DIR / "conv2.dat"), q=8)
+    conv3_int8.load_weights_from_binary(str(PARAM_DIR / "conv3.dat"), q=8)
+    conv4_int8.load_weights_from_binary(str(PARAM_DIR / "conv4.dat"), q=8)
+    fc_int8.load_weights_from_binary(str(PARAM_DIR / "fc.dat"), q=6)
 
     return {
         'conv1': conv1, 'conv2': conv2, 'conv3': conv3, 'conv4': conv4, 'fc': fc,
@@ -95,73 +95,73 @@ class TestConvLayers:
         """Test Conv1 layer with int8 quantization."""
         test_dir = DATA_DIR / test_dir_name
         
-        # Load input and expected output
-        input_data = SimData.load_data_from_binary(
-            str(test_dir / "conv1.input.dat"), 1, 32, 32, scale=1.0
+        # Load input and expected output (returns SimData objects)
+        input_simdata = SimData.load_data_from_binary(
+            str(test_dir / "conv1.input.dat"), 1, 32, 32, q=7
         )
-        expected_output = SimData.load_data_from_binary(
-            str(test_dir / "conv1.output.dat"), 32, 32, 32, scale=1.0
+        expected_simdata = SimData.load_data_from_binary(
+            str(test_dir / "conv1.output.dat"), 32, 32, 32, q=5
         )
         
-        # Forward pass
-        output = layers['conv1_int8'].forward(input_data)
+        # Forward pass (output_q=0, should result in requant_shift=0)
+        output_simdata = layers['conv1_int8'].forward(input_simdata, output_q=5)
         
         # Assert equality with detailed diagnostics
-        assert_arrays_equal_with_details(output, expected_output, f"Conv1 ({test_dir_name})")
+        assert_arrays_equal_with_details(output_simdata.data, expected_simdata.data, f"Conv1 ({test_dir_name})")
     
     def test_conv2_int8(self, layers, test_dir_name):
         """Test Conv2 layer with int8 quantization."""
         test_dir = DATA_DIR / test_dir_name
         
         # Load input and expected output
-        input_data = SimData.load_data_from_binary(
-            str(test_dir / "conv2.input.dat"), 32, 16, 16, scale=1.0
+        input_simdata = SimData.load_data_from_binary(
+            str(test_dir / "conv2.input.dat"), 32, 16, 16, q=5
         )
-        expected_output = SimData.load_data_from_binary(
-            str(test_dir / "conv2.output.dat"), 64, 16, 16, scale=1.0
+        expected_simdata = SimData.load_data_from_binary(
+            str(test_dir / "conv2.output.dat"), 64, 16, 16, q=5
         )
         
-        # Forward pass
-        output = layers['conv2_int8'].forward(input_data)
+        # Forward pass (output_q=0, should result in requant_shift=0)
+        output_simdata = layers['conv2_int8'].forward(input_simdata, output_q=5)
         
         # Assert equality with detailed diagnostics
-        assert_arrays_equal_with_details(output, expected_output, f"Conv2 ({test_dir_name})")
+        assert_arrays_equal_with_details(output_simdata.data, expected_simdata.data, f"Conv2 ({test_dir_name})")
     
     def test_conv3_int8(self, layers, test_dir_name):
         """Test Conv3 layer with int8 quantization."""
         test_dir = DATA_DIR / test_dir_name
         
         # Load input and expected output
-        input_data = SimData.load_data_from_binary(
-            str(test_dir / "conv3.input.dat"), 64, 16, 16, scale=1.0
+        input_simdata = SimData.load_data_from_binary(
+            str(test_dir / "conv3.input.dat"), 64, 16, 16, q=5
         )
-        expected_output = SimData.load_data_from_binary(
-            str(test_dir / "conv3.output.dat"), 64, 8, 8, scale=1.0
+        expected_simdata = SimData.load_data_from_binary(
+            str(test_dir / "conv3.output.dat"), 64, 8, 8, q=5
         )
         
-        # Forward pass
-        output = layers['conv3_int8'].forward(input_data)
+        # Forward pass (output_q=0, should result in requant_shift=0)
+        output_simdata = layers['conv3_int8'].forward(input_simdata, output_q=5)
         
         # Assert equality with detailed diagnostics
-        assert_arrays_equal_with_details(output, expected_output, f"Conv3 ({test_dir_name})")
+        assert_arrays_equal_with_details(output_simdata.data, expected_simdata.data, f"Conv3 ({test_dir_name})")
     
     def test_conv4_int8(self, layers, test_dir_name):
         """Test Conv4 layer with int8 quantization."""
         test_dir = DATA_DIR / test_dir_name
         
         # Load input and expected output
-        input_data = SimData.load_data_from_binary(
-            str(test_dir / "conv4.input.dat"), 64, 8, 8, scale=1.0
+        input_simdata = SimData.load_data_from_binary(
+            str(test_dir / "conv4.input.dat"), 64, 8, 8, q=5
         )
-        expected_output = SimData.load_data_from_binary(
-            str(test_dir / "conv4.output.dat"), 128, 4, 4, scale=1.0
+        expected_simdata = SimData.load_data_from_binary(
+            str(test_dir / "conv4.output.dat"), 128, 4, 4, q=5
         )
         
-        # Forward pass
-        output = layers['conv4_int8'].forward(input_data)
+        # Forward pass (output_q=0, should result in requant_shift=0)
+        output_simdata = layers['conv4_int8'].forward(input_simdata, output_q=5)
         
         # Assert equality with detailed diagnostics
-        assert_arrays_equal_with_details(output, expected_output, f"Conv4 ({test_dir_name})")
+        assert_arrays_equal_with_details(output_simdata.data, expected_simdata.data, f"Conv4 ({test_dir_name})")
 
 
 @pytest.mark.parametrize("test_dir_name", TEST_DIRS)
@@ -173,19 +173,20 @@ class TestFcLayer:
         test_dir = DATA_DIR / test_dir_name
         
         # Load input and expected output
-        input_data = SimData.load_data_from_binary(
-            str(test_dir / "fc.input.dat"), 128, 1, 1, scale=1.0
+        input_simdata = SimData.load_data_from_binary(
+            str(test_dir / "fc.input.dat"), 128, 1, 1, q=5
         )
-        expected_output = SimData.load_data_from_binary(
-            str(test_dir / "fc.output.dat"), 10, 1, 1, scale=1.0
+        expected_simdata = SimData.load_data_from_binary(
+            str(test_dir / "fc.output.dat"), 10, 1, 1, q=5
         )
         
-        # Forward pass (flatten input for FC layer)
-        output = layers['fc_int8'].forward(input_data.reshape(1, -1))
-        expected_output = expected_output.reshape(1, -1)
+        # Forward pass (output_q=0, should result in requant_shift=0)
+        # FcLayer will automatically handle flattening
+        output_simdata = layers['fc_int8'].forward(input_simdata, output_q=5)
+        expected_output = expected_simdata.data.reshape(1, -1)
         
         # Assert equality with detailed diagnostics
-        assert_arrays_equal_with_details(output, expected_output, f"FC ({test_dir_name})")
+        assert_arrays_equal_with_details(output_simdata.data, expected_output, f"FC ({test_dir_name})")
 
 
 if __name__ == "__main__":
