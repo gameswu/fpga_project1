@@ -9,3 +9,7 @@ __pycache__/
 .vscode/
 
 .DS_Store
+
+# verilog test
+*.out
+*.vcd

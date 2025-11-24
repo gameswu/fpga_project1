@@ -10,7 +10,15 @@ fpga_project1/
 │   ├── test.py              # Test script for the simulator
 │   ├── sim.py               # Simulator implementation
 │   └── data/                # Test data for the simulator
+│
+├── PE/                     # PE core implementation
 ├── requirements.txt         # Python dependencies
 ├── README.md                # Project documentation
 └── docs/                    # Additional project documents
 ```
+
+## Architecture Design
+For detailed information about the architecture design of the FPGA project, including key components and their interactions, please refer to the [Architecture Design Document](docs/Arch.md).
+
+## License
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details
