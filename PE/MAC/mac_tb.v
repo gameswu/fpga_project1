@@ -134,9 +134,11 @@ module mac_tb;
         // Test 4: Clear accumulator
         // =====================================================================
         $display("\n[TEST 4] Clear accumulator");
+        enable    = 0;  // Disable during clear
         acc_clear = 1;
         #10;
         acc_clear = 0;
+        #10;  // Wait one more cycle for clear to take effect
         $display("  Expected: 0, Got: %d", acc_out);
         if (acc_out == 32'sd0)
             $display("  [PASS]");
@@ -147,11 +149,14 @@ module mac_tb;
         // Test 5: Negative weight
         // =====================================================================
         $display("\n[TEST 5] Load weight = -4, compute 8 * (-4)");
+        enable      = 0;  // Disable during weight load
         weight_in   = -8'sd4;
         weight_load = 1;
         #10;
         weight_load = 0;
+        #10;  // Wait for weight to stabilize
         
+        enable  = 1;  // Enable MAC
         data_in = 8'sd8;
         #10;
         $display("  Expected: -32, Got: %d", acc_out);
@@ -186,16 +191,20 @@ module mac_tb;
         // Test 7: Overflow handling (large accumulation)
         // =====================================================================
         $display("\n[TEST 7] Test INT32 accumulation (prevent overflow)");
+        enable    = 0;  // Disable during setup
         acc_clear = 1;
         #10;
         acc_clear = 0;
+        #10;  // Wait for clear to take effect
         
         weight_in   = 8'sd127;  // Max INT8
         weight_load = 1;
         #10;
         weight_load = 0;
+        #10;  // Wait for weight to stabilize
         
         // Accumulate 1000 times: 1000 * (127 * 127) = 16,129,000
+        enable  = 1;  // Enable MAC
         data_in = 8'sd127;
         repeat (1000) begin
             #10;
