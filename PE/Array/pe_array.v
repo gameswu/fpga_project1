@@ -1,26 +1,25 @@
 /**
- * PE Array (16x16 Systolic-like Array)
+ * PE Array (16x16 Systolic Array) - Weight Stationary Version
  * 
  * Description:
  *   16x16 Array of MAC units implementing Weight Stationary dataflow.
+ *   Implements Input Skewing (Diagonal Feed) to support vertical systolic accumulation.
  *   
- * Architecture:
- *   - Rows: 16 Rows.
- *   - Columns: 16 Columns.
- *   - Weights: Unique weight for each PE.
- *   - Inputs: Unique input for each PE.
- *   - Outputs: 256 Accumulators (16x16), output in parallel.
- *
- * Dataflow:
- *   1. Weight Load: Assert weight_load. Provide 256 weights (one per PE).
- *      Weights are latched into MAC units.
- *   2. Compute: Assert enable. Provide 256 inputs (one per PE).
- *      Each PE(i,j) computes: Acc += Input(i,j) * Weight(i,j).
- *   3. Repeat Compute for all input channels/kernel pixels.
- *   4. Readout: Read acc_out.
+ *   Dataflow:
+ *   - Weights: Stationary (Loaded once).
+ *   - Inputs: Broadcast to rows, but skewed in time.
+ *     Row 0 receives Input[0] at T.
+ *     Row 1 receives Input[1] at T+1.
+ *     ...
+ *     Row 15 receives Input[15] at T+15.
+ *   - Partial Sums: Cascade vertically.
+ *     Row 0 computes at T, outputs at T+1.
+ *     Row 1 adds to Psum at T+1, outputs at T+2.
+ *     ...
+ *     Row 15 outputs final result at T+16.
  *
  * Author: shealligh
- * Date: 2025-11-24
+ * Date: 2025-12-11
  */
 
 module pe_array #(
@@ -31,61 +30,104 @@ module pe_array #(
     input wire clk,
     input wire rst_n,
     
-    // Global Control Signals
-    input wire enable,          // Enable computation in all PEs
-    input wire acc_clear,       // Clear accumulators in all PEs
-    input wire weight_load,     // Load weights into all PEs
+    // Weight Loading Interface
+    input wire weight_we,
+    input wire [3:0] weight_row,
+    input wire [3:0] weight_col,
+    input wire [DATA_WIDTH-1:0] weight_in,
     
-    // Data Inputs
-    // Unique data for each PE
-    // Width: 16 * 16 * 8 = 2048 bits
-    input wire [ARRAY_DIM*ARRAY_DIM*DATA_WIDTH-1:0] data_in, 
+    // Data Inputs (Vector of 16 bytes)
+    // data_in[0] -> Row 0 (Input Channel 0)
+    // ...
+    // data_in[15] -> Row 15 (Input Channel 15)
+    input wire [ARRAY_DIM*DATA_WIDTH-1:0] data_in,
     
-    // Weight Inputs
-    // Unique weight for each PE
-    // Width: 16 * 16 * 8 = 2048 bits
-    input wire [ARRAY_DIM*ARRAY_DIM*DATA_WIDTH-1:0] weight_in,
-    
-    // Outputs
-    // All 256 Accumulators output in parallel
-    // Width: 16 * 16 * 32 = 8192 bits
-    // Layout: Row 0 (Cols 0..15), Row 1 (Cols 0..15), ...
-    output wire [ARRAY_DIM*ARRAY_DIM*ACC_WIDTH-1:0] acc_out
+    // Partial Sum Outputs (From Bottom Row)
+    output wire [ARRAY_DIM*ACC_WIDTH-1:0] psum_out
 );
 
-    // Generate variable
-    genvar i, j;
+    // =========================================================================
+    // Input Skewing (Delay Lines)
+    // =========================================================================
     
+    // row_data_in[r] is the skewed input for Row r
+    wire signed [DATA_WIDTH-1:0] row_data_in [0:ARRAY_DIM-1];
+    
+    // Generate delay registers
+    genvar i;
     generate
-        for (i = 0; i < ARRAY_DIM; i = i + 1) begin : ROW
-            for (j = 0; j < ARRAY_DIM; j = j + 1) begin : COL
+        for (i = 0; i < ARRAY_DIM; i = i + 1) begin : ROW_DELAYS
+            if (i == 0) begin
+                // Row 0: No delay
+                assign row_data_in[i] = data_in[DATA_WIDTH-1:0];
+            end else begin
+                // Row i: i cycles delay
+                reg [DATA_WIDTH-1:0] dly_regs [0:i-1];
+                integer k;
                 
-                // Calculate indices for flattened arrays
-                // Weight index depends on Row (i) and Column (j)
-                localparam W_IDX = (i * ARRAY_DIM + j) * DATA_WIDTH;
+                always @(posedge clk or negedge rst_n) begin
+                    if (!rst_n) begin
+                        for (k = 0; k < i; k = k + 1) dly_regs[k] <= 0;
+                    end else begin
+                        dly_regs[0] <= data_in[i*DATA_WIDTH +: DATA_WIDTH];
+                        for (k = 1; k < i; k = k + 1) begin
+                            dly_regs[k] <= dly_regs[k-1];
+                        end
+                    end
+                end
                 
-                // Data index depends on Row (i) and Column (j)
-                localparam D_IDX = (i * ARRAY_DIM + j) * DATA_WIDTH;
+                assign row_data_in[i] = dly_regs[i-1];
+            end
+        end
+    endgenerate
+
+    // =========================================================================
+    // PE Array Instantiation
+    // =========================================================================
+
+    // Internal Psum Wires
+    // psum_inter[row][col] is input to PE[row][col]
+    // psum_inter[row+1][col] is output of PE[row][col]
+    wire [ACC_WIDTH-1:0] psum_inter [0:ARRAY_DIM][0:ARRAY_DIM-1];
+    
+    // Initialize top row psum inputs to 0
+    genvar c;
+    generate
+        for (c = 0; c < ARRAY_DIM; c = c + 1) begin : TOP_ROW
+            assign psum_inter[0][c] = {ACC_WIDTH{1'b0}};
+        end
+    endgenerate
+    
+    // Instantiate PEs
+    genvar r;
+    generate
+        for (r = 0; r < ARRAY_DIM; r = r + 1) begin : ROWS
+            for (c = 0; c < ARRAY_DIM; c = c + 1) begin : COLS
                 
-                // Output index depends on Row (i) and Column (j)
-                // Flattened as Row-Major: (Row * Width + Col)
-                localparam OUT_IDX = (i * ARRAY_DIM + j) * ACC_WIDTH;
+                // Weight Load Logic for this PE
+                wire pe_load = weight_we && (weight_row == r[3:0]) && (weight_col == c[3:0]);
                 
-                // Instantiate MAC Unit
                 mac u_mac (
                     .clk(clk),
                     .rst_n(rst_n),
-                    .enable(enable),
-                    .acc_clear(acc_clear),
-                    .weight_load(weight_load),
-                    // Input Data for PE(i,j)
-                    .data_in(data_in[D_IDX +: DATA_WIDTH]),
-                    // Weight Data for PE(i,j)
-                    .weight_in(weight_in[W_IDX +: DATA_WIDTH]),
-                    // Accumulator Output
-                    .acc_out(acc_out[OUT_IDX +: ACC_WIDTH])
+                    .weight_load(pe_load),
+                    // Input Data (Skewed)
+                    .data_in(row_data_in[r]),
+                    // Weight Data (From common input)
+                    .weight_in(weight_in),
+                    // Partial Sum Input (From PE above)
+                    .psum_in(psum_inter[r][c]),
+                    // Partial Sum Output (To PE below)
+                    .psum_out(psum_inter[r+1][c])
                 );
             end
+        end
+    endgenerate
+    
+    // Assign Outputs from bottom row
+    generate
+        for (c = 0; c < ARRAY_DIM; c = c + 1) begin : OUT_ASSIGN
+            assign psum_out[c*ACC_WIDTH +: ACC_WIDTH] = psum_inter[ARRAY_DIM][c];
         end
     endgenerate
 

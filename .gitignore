@@ -14,3 +14,5 @@ __pycache__/
 *.out
 *.vcd
 *.vvp
+
+build/

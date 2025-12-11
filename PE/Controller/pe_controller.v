@@ -3,347 +3,323 @@
  * 
  * Description:
  *   Orchestrates 16x16 PE Array for convolution operations.
- *   Implements Weight Stationary dataflow with tiling support.
+ *   Implements Weight Stationary dataflow (Spatial Parallelism).
  *   
- * Features:
- *   - Tiling for Output Channels and Spatial Dimensions
- *   - Weight Stationary dataflow
- *   - Automatic padding handling
- *   - Address generation for Weight and Input memories
+ *   Dataflow:
+ *   1. Iterate over Output Tiles (Spatial).
+ *   2. Iterate over Kernel (ky, kx) and Input Channels.
+ *   3. Load Weight (Broadcast to all PEs).
+ *   4. Load Input Tile (16x16 spatial patch).
+ *   5. PEs accumulate: Acc += Input * Weight.
+ *   6. Repeat for all ky, kx, Cin.
+ *   7. Output final result.
  *
- * Author: Auto-generated for fpga_project1
- * Date: 2025-12-01
+ *   Buffer Note:
+ *   The "Buffer" for accumulating partial sums across the kernel/channel 
+ *   dimensions is the internal Accumulator register within each MAC unit.
+ *   This allows "same position needs to add" without external buffering
+ *   until the full kernel window is processed.
+ *
+ * Author: shealligh
+ * Date: 2025-12-08
  */
 
 module pe_controller #(
-    parameter ARRAY_DIM = 16,      // PE Array dimension (16x16)
-    parameter IFM_H     = 32,      // Input Feature Map Height
-    parameter IFM_W     = 32,      // Input Feature Map Width
-    parameter OFM_H     = 32,      // Output Feature Map Height
-    parameter OFM_W     = 32,      // Output Feature Map Width
-    parameter K_H       = 5,       // Kernel Height
-    parameter K_W       = 5,       // Kernel Width
-    parameter PAD       = 2,       // Padding
-    parameter STRIDE    = 1,       // Stride
-    parameter CHANNELS  = 32       // Number of Output Channels
+    parameter ARRAY_DIM = 16,
+    parameter MAX_H = 32,
+    parameter MAX_W = 32
 ) (
-    // Clock and Reset
     input  wire        clk,
     input  wire        rst_n,
     
     // Control Interface
-    input  wire        start,           // Start convolution operation
-    output reg         done,            // Operation complete
+    input  wire        start,
+    output reg         done,
     
-    // PE Array Control Signals
-    output reg         enable,          // Enable PE Array computation
-    output reg         acc_clear,       // Clear PE Array accumulators
-    output reg         weight_load,     // Load weights into PE Array
+    // Configuration (Variable Sizes)
+    input  wire [3:0]  kernel_h,
+    input  wire [3:0]  kernel_w,
+    input  wire [7:0]  input_h,
+    input  wire [7:0]  input_w,
     
-    // PE Array Data Interface (16x16 array, 8-bit per element)
-    output reg  [ARRAY_DIM*8-1:0]      pe_data_in,     // 2048 bits: Input broadcast to columns
-    output reg  [ARRAY_DIM*8-1:0]      pe_weight_in,   // 2048 bits: Weight broadcast to rows
-    input  wire [ARRAY_DIM*ARRAY_DIM*32-1:0] pe_acc_out,  // 8192 bits: Accumulator outputs
+    // PE Array Interface
+    output reg         weight_we,
+    output reg  [3:0]  weight_row,
+    output reg  [3:0]  weight_col,
+    output reg  [7:0]  weight_data,
+    output reg  [ARRAY_DIM*8-1:0] pe_data_in, // Broadcast to rows
     
-    // Weight Memory Interface
-    output reg  [15:0] weight_addr,     // Address for Weight Memory
-    input  wire [ARRAY_DIM*8-1:0] weight_rdata,  // 128 bits: 16 INT8 weights
+    // Accumulator / Buffer Interface
+    output reg         acc_enable,
+    output reg         acc_clear,
+    output reg  [9:0]  acc_addr,
+    input  wire [ARRAY_DIM*32-1:0] pe_acc_out, // From Array (Bottom)
     
-    // Input Memory Interface
-    output reg  signed [15:0] input_ref_y,   // Reference Y coordinate
-    output reg  signed [15:0] input_ref_x,   // Reference X coordinate
-    input  wire [ARRAY_DIM*8-1:0] input_rdata,  // 128 bits: 16 INT8 pixels
+    // External Memory Interface (Simplified)
+    output reg  [15:0] weight_mem_addr,
+    input  wire [31:0] weight_mem_data,
     
-    // Output Interface
-    output reg         output_valid,    // Output data is valid
-    output reg  [ARRAY_DIM*ARRAY_DIM*32-1:0] output_data  // 8192 bits: Final results
+    output reg  [15:0] input_mem_addr,
+    input  wire [ARRAY_DIM*8-1:0] input_mem_data // Vector of 16 bytes
 );
 
-    // =========================================================================
-    // Local Parameters
-    // =========================================================================
+    // State Machine
+    localparam S_IDLE = 0;
+    localparam S_LOAD_WEIGHT_INIT = 1;
+    localparam S_LOAD_WEIGHT_LOOP = 2;
+    localparam S_STREAM_INIT = 3;
+    localparam S_STREAM_RUN = 4;
+    localparam S_NEXT_KERNEL = 5;
+    localparam S_DONE = 6;
+    localparam S_LOAD_WEIGHT_WAIT = 7;
     
-    // Calculate number of tiles
-    localparam NUM_CHANNEL_TILES = (CHANNELS + ARRAY_DIM - 1) / ARRAY_DIM;
-    localparam NUM_SPATIAL_TILES = ((OFM_H * OFM_W) + ARRAY_DIM - 1) / ARRAY_DIM;
+    reg [2:0] state;
     
-    // State Machine States
-    localparam STATE_IDLE         = 4'd0;
-    localparam STATE_START_TILE   = 4'd1;
-    localparam STATE_LOAD_WEIGHT  = 4'd2;
-    localparam STATE_WAIT_WEIGHT  = 4'd3;
-    localparam STATE_COMPUTE      = 4'd4;
-    localparam STATE_WAIT_COMPUTE = 4'd5;
-    localparam STATE_READ_OUT     = 4'd6;
-    localparam STATE_DONE         = 4'd7;
+    // Output Dimensions (defined by input_h/w in this controller version)
+    // Ideally, input_h/w should be output_h/w, and we read from (oy+ky, ox+kx)
+    // Let's assume the configured input_h/w are actually the OUTPUT dimensions we want to iterate over.
     
+    // Loop Counters
+    reg [3:0] ky, kx;
+    reg [7:0] oy, ox; // Output Y, Output X
     
-    // =========================================================================
-    // Internal Registers
-    // =========================================================================
+    // Weight Loading Counters
+    reg [3:0] wr, wc;
     
-    reg [3:0] state, next_state;
+    // Pipeline Delay Logic
+    // Array Latency = 16 cycles (1 reg per row)
+    // Memory Read Latency = 3 cycles (Addr->Mem->Reg->Valid)
+    // Total Latency = 19 cycles.
+    reg [18:0] acc_enable_pipe;
+    reg [18:0] acc_clear_pipe;
+    reg [9:0]  acc_addr_pipe [0:18];
+    reg [4:0]  drain_cnt;
     
-    // Tile counters
-    reg [7:0] channel_tile_idx;   // Current output channel tile (0..NUM_CHANNEL_TILES-1)
-    reg [7:0] spatial_tile_idx;   // Current spatial tile (0..NUM_SPATIAL_TILES-1)
-    
-    // Kernel position counters
-    reg [7:0] ky;                 // Kernel Y position (0..K_H-1)
-    reg [7:0] kx;                 // Kernel X position (0..K_W-1)
-    
-    // Output position within current tile
-    reg [7:0] tile_oy;            // Output Y within tile (0..3)
-    reg [7:0] tile_ox;            // Output X within tile (0..3)
-    
-    // Absolute output position
-    reg [7:0] abs_oy;             // Absolute output Y
-    reg [7:0] abs_ox;             // Absolute output X
-    
-    // Input coordinates (can be negative due to padding)
-    reg signed [15:0] input_y;
-    reg signed [15:0] input_x;
-    
-    // Wait counter
-    reg [3:0] wait_cnt;
-    
-    
-    // =========================================================================
-    // State Machine - Sequential Logic
-    // =========================================================================
-    
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            state <= STATE_IDLE;
-        else
-            state <= next_state;
-    end
-    
-    
-    // =========================================================================
-    // State Machine - Combinational Logic
-    // =========================================================================
-    
-    always @(*) begin
-        // Default values
-        next_state = state;
-        
-        case (state)
-            STATE_IDLE: begin
-                if (start)
-                    next_state = STATE_START_TILE;
-            end
-            
-            STATE_START_TILE: begin
-                next_state = STATE_LOAD_WEIGHT;
-            end
-            
-            STATE_LOAD_WEIGHT: begin
-                next_state = STATE_WAIT_WEIGHT;
-            end
-            
-            STATE_WAIT_WEIGHT: begin
-                if (wait_cnt == 0)
-                    next_state = STATE_COMPUTE;
-            end
-            
-            STATE_COMPUTE: begin
-                next_state = STATE_WAIT_COMPUTE;
-            end
-            
-            STATE_WAIT_COMPUTE: begin
-                if (wait_cnt == 0) begin
-                    // Check if kernel scan is complete
-                    if (kx == K_W - 1 && ky == K_H - 1)
-                        next_state = STATE_READ_OUT;
-                    else
-                        next_state = STATE_LOAD_WEIGHT;
-                end
-            end
-            
-            STATE_READ_OUT: begin
-                // Check if all tiles are done (check before incrementing)
-                if (spatial_tile_idx == NUM_SPATIAL_TILES - 1 && 
-                    channel_tile_idx == NUM_CHANNEL_TILES - 1)
-                    next_state = STATE_DONE;
-                else
-                    next_state = STATE_START_TILE;
-            end
-            
-            STATE_DONE: begin
-                next_state = STATE_IDLE;
-            end
-            
-            default: begin
-                next_state = STATE_IDLE;
-            end
-        endcase
-    end
-    
-    
-    // =========================================================================
-    // Counter Updates
-    // =========================================================================
-    
+    // Weight Loading Pipeline
+    reg [3:0] wr_d1, wc_d1, wr_d2, wc_d2;
+    reg we_d1, we_d2;
+    reg [1:0] load_wait_cnt;
+
+    integer p;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            channel_tile_idx <= 0;
-            spatial_tile_idx <= 0;
-            ky <= 0;
-            kx <= 0;
-            wait_cnt <= 0;
+            acc_enable_pipe <= 0;
+            acc_clear_pipe <= 0;
+            for (p=0; p<19; p=p+1) acc_addr_pipe[p] <= 0;
+            
+            we_d1 <= 0; we_d2 <= 0;
+            wr_d1 <= 0; wc_d1 <= 0;
+            wr_d2 <= 0; wc_d2 <= 0;
+        end else begin
+            // Shift Register for Accumulator
+            for (p=18; p>0; p=p-1) begin
+                acc_enable_pipe[p] <= acc_enable_pipe[p-1];
+                acc_clear_pipe[p] <= acc_clear_pipe[p-1];
+                acc_addr_pipe[p] <= acc_addr_pipe[p-1];
+            end
+            
+            // Pipeline for Weight Loading
+            // Input to d1 comes from current state (wr, wc)
+            // Only valid during LOAD_WEIGHT_LOOP
+            we_d1 <= (state == S_LOAD_WEIGHT_LOOP);
+            wr_d1 <= wr;
+            wc_d1 <= wc;
+            
+            we_d2 <= we_d1;
+            wr_d2 <= wr_d1;
+            wc_d2 <= wc_d1;
         end
-        else begin
+    end
+    
+    // Output the delayed signals
+    always @(*) begin
+        acc_enable = acc_enable_pipe[18]; // Delayed by 19
+        acc_clear = acc_clear_pipe[18];
+        acc_addr = acc_addr_pipe[18];
+        if (acc_enable === 1'bx) $display("Time %t: acc_enable is X!", $time);
+    end
+    
+    // Drive Weight Outputs from Pipeline
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            weight_we <= 0;
+            weight_row <= 0;
+            weight_col <= 0;
+            weight_data <= 0;
+        end else begin
+            weight_we <= we_d2;
+            weight_row <= wr_d2;
+            weight_col <= wc_d2;
+            weight_data <= weight_mem_data[7:0]; // Captures data corresponding to address at T-2
+        end
+    end
+    
+    // Continuous Data Capture
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) pe_data_in <= 0;
+        else pe_data_in <= input_mem_data;
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= S_IDLE;
+            done <= 0;
+            ky <= 0; kx <= 0;
+            oy <= 0; ox <= 0;
+            wr <= 0; wc <= 0;
+            drain_cnt <= 0;
+            load_wait_cnt <= 0;
+        end else begin
+            // Defaults
+            // weight_we <= 0; // Removed, driven by separate block
+            done <= 0;
+            
+            // Default pipe input (0 unless overridden)
+            acc_enable_pipe[0] <= 0;
+            acc_clear_pipe[0] <= 0;
+            acc_addr_pipe[0] <= 0;
+            
             case (state)
-                STATE_IDLE: begin
+                S_IDLE: begin
                     if (start) begin
-                        channel_tile_idx <= 0;
-                        spatial_tile_idx <= 0;
-                        ky <= 0;
-                        kx <= 0;
+                        state <= S_LOAD_WEIGHT_INIT;
+                        ky <= 0; kx <= 0;
                     end
                 end
                 
-                STATE_START_TILE: begin
-                    ky <= 0;
-                    kx <= 0;
+                // -------------------------------------------------------------
+                // 1. Load Weights for current (ky, kx) slice
+                // -------------------------------------------------------------
+                S_LOAD_WEIGHT_INIT: begin
+                    wr <= 0; wc <= 0;
+                    state <= S_LOAD_WEIGHT_LOOP;
                 end
                 
-                STATE_WAIT_WEIGHT: begin
-                    if (wait_cnt > 0)
-                        wait_cnt <= wait_cnt - 1;
-                end
-                
-                STATE_LOAD_WEIGHT: begin
-                    wait_cnt <= 2;  // Wait 2 cycles for weight loading
-                end
-                
-                STATE_COMPUTE: begin
-                    wait_cnt <= 1;  // Wait 1 cycle for computation
-                end
-                
-                STATE_WAIT_COMPUTE: begin
-                    if (wait_cnt > 0) begin
-                        wait_cnt <= wait_cnt - 1;
+                S_LOAD_WEIGHT_LOOP: begin
+                    // Fetch weight from memory
+                    weight_mem_addr <= (ky * kernel_w + kx) * 256 + wr * 16 + wc;
+                    
+                    // Outputs are driven by pipeline registers
+                    
+                    if (wc == 15) begin
+                        wc <= 0;
+                        if (wr == 15) begin
+                            state <= S_LOAD_WEIGHT_WAIT; // Wait for pipeline to drain
+                            load_wait_cnt <= 0;
+                        end else begin
+                            wr <= wr + 1;
+                        end
+                    end else begin
+                        wc <= wc + 1;
                     end
-                    else begin
-                        // Increment kernel position after wait completes
-                        if (kx == K_W - 1) begin
+                end
+                
+                S_LOAD_WEIGHT_WAIT: begin
+                    // Wait 2 cycles for pipeline to finish writing weights
+                    if (load_wait_cnt == 2) begin
+                        state <= S_STREAM_INIT;
+                    end else begin
+                        load_wait_cnt <= load_wait_cnt + 1;
+                    end
+                end
+                
+                // -------------------------------------------------------------
+                // 2. Stream Input Image (Iterate over Output Pixels)
+                // -------------------------------------------------------------
+                S_STREAM_INIT: begin
+                    oy <= 0; ox <= 0;
+                    state <= S_STREAM_RUN;
+                end
+                
+                S_STREAM_RUN: begin
+                    // Drive Inputs
+                    // Convolution: Read Input at (oy+ky, ox+kx)
+                    // We assume input_mem is large enough.
+                    // Address = (oy + ky) * (input_w + kernel_w - 1) + (ox + kx) ?
+                    // No, let's assume the memory is organized as a 1D array of vectors.
+                    // And the "Stride" is the full input width.
+                    // Let's assume the user configures 'input_w' as the OUTPUT width for loop bounds,
+                    // but we need the TRUE input width for addressing.
+                    // For simplicity in this demo, let's assume Input Width = Output Width + Kernel Width - 1.
+                    // Or simpler: Just use a fixed stride or assume Input Width = input_w (and we handle padding/boundary externally).
+                    
+                    // Let's stick to the simplest valid convolution logic:
+                    // We iterate oy, ox. We read Input[oy+ky][ox+kx].
+                    // We need to know the stride (Input Width).
+                    // Let's assume stride = input_w + kernel_w - 1 (Valid padding).
+                    // OR, let's just use (oy+ky) * 256 + (ox+kx) if we assume a large fixed stride?
+                    // No, let's use the provided input_w parameter as the stride, assuming it represents the full input width.
+                    // And we iterate oy up to (input_h - kernel_h + 1).
+                    
+                    input_mem_addr <= (oy + ky) * input_w + (ox + kx);
+                    
+                    if (input_mem_data === 128'bx) $display("Time %t: input_mem_data is X at addr %d", $time, (oy + ky) * input_w + (ox + kx));
+                    
+                    // Accumulator Control
+                    // We accumulate into (oy, ox)
+                    acc_enable_pipe[0] <= 1;
+                    acc_addr_pipe[0] <= oy * input_w + ox; // Use same stride for output for now
+                    
+                    if (ky == 0 && kx == 0) 
+                        acc_clear_pipe[0] <= 1;
+                    else 
+                        acc_clear_pipe[0] <= 0;
+                        
+                    // Loop Spatial
+                    // We iterate up to input_w - kernel_w?
+                    // Let's assume the state machine iterates over the VALID output range.
+                    // For this specific testbench, we will control input_h/w to be the output size.
+                    if (ox == input_w - kernel_w) begin // Simple boundary check for "Valid" convolution
+                        ox <= 0;
+                        if (oy == input_h - kernel_h) begin
+                            state <= S_NEXT_KERNEL;
+                        end else begin
+                            oy <= oy + 1;
+                        end
+                    end else begin
+                        ox <= ox + 1;
+                    end
+                end
+                
+                // -------------------------------------------------------------
+                // 3. Next Kernel Slice
+                // -------------------------------------------------------------
+                S_NEXT_KERNEL: begin
+                    acc_enable_pipe[0] <= 0; // Ensure disabled
+                    
+                    // Wait for pipeline to drain?
+                    // The controller moves to LOAD_WEIGHT immediately.
+                    // But the array is still processing the last 16 inputs.
+                    // We need to wait 16 cycles before starting the next kernel load?
+                    // Actually, loading weights doesn't affect the pipeline flow IF we don't overwrite weights being used.
+                    // But we ARE overwriting weights.
+                    // So we MUST wait for the pipeline to drain (16 cycles).
+                    
+                    if (drain_cnt == 16) begin
+                        drain_cnt <= 0;
+                        if (kx == kernel_w - 1) begin
                             kx <= 0;
-                            if (ky == K_H - 1)
-                                ky <= 0;  // Reset for next tile
-                            else
+                            if (ky == kernel_h - 1) begin
+                                state <= S_DONE;
+                            end else begin
                                 ky <= ky + 1;
-                        end
-                        else begin
+                                state <= S_LOAD_WEIGHT_INIT;
+                            end
+                        end else begin
                             kx <= kx + 1;
+                            state <= S_LOAD_WEIGHT_INIT;
                         end
+                    end else begin
+                        drain_cnt <= drain_cnt + 1;
                     end
                 end
                 
-                STATE_READ_OUT: begin
-                    // Move to next tile
-                    if (spatial_tile_idx == NUM_SPATIAL_TILES - 1) begin
-                        spatial_tile_idx <= 0;
-                        if (channel_tile_idx < NUM_CHANNEL_TILES - 1)
-                            channel_tile_idx <= channel_tile_idx + 1;
-                    end
-                    else begin
-                        spatial_tile_idx <= spatial_tile_idx + 1;
-                    end
-                end
-            endcase
-        end
-    end
-    
-    
-    // =========================================================================
-    // Output Position Calculation
-    // =========================================================================
-    
-    always @(*) begin
-        // Calculate absolute output position from spatial tile index
-        abs_oy = (spatial_tile_idx * ARRAY_DIM) / OFM_W;
-        abs_ox = (spatial_tile_idx * ARRAY_DIM) % OFM_W;
-    end
-    
-    
-    // =========================================================================
-    // Address Generation and Control Signals
-    // =========================================================================
-    
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            enable       <= 0;
-            acc_clear    <= 0;
-            weight_load  <= 0;
-            done         <= 0;
-            output_valid <= 0;
-            weight_addr  <= 0;
-            input_ref_y  <= 0;
-            input_ref_x  <= 0;
-            pe_data_in   <= 0;
-            pe_weight_in <= 0;
-            output_data  <= 0;
-        end
-        else begin
-            // Default: clear control signals
-            enable       <= 0;
-            acc_clear    <= 0;
-            weight_load  <= 0;
-            done         <= 0;
-            output_valid <= 0;
-            
-            case (state)
-                STATE_IDLE: begin
-                    // Reset outputs
-                    weight_addr  <= 0;
-                    input_ref_y  <= 0;
-                    input_ref_x  <= 0;
-                end
-                
-                STATE_START_TILE: begin
-                    // Clear accumulators at start of new tile
-                    acc_clear <= 1;
-                end
-                
-                STATE_LOAD_WEIGHT: begin
-                    // Generate weight address
-                    // Address = (channel_tile * K_H * K_W * ARRAY_DIM) + (ky * K_W + kx) * ARRAY_DIM
-                    weight_addr <= (channel_tile_idx * K_H * K_W * ARRAY_DIM) + 
-                                   ((ky * K_W + kx) * ARRAY_DIM);
-                    
-                    // Load weight data into PE array
-                    weight_load  <= 1;
-                    pe_weight_in <= weight_rdata;
-                end
-                
-                STATE_COMPUTE: begin
-                    // Calculate input coordinate
-                    input_y = $signed(abs_oy) * STRIDE + $signed(ky) - PAD;
-                    input_x = $signed(abs_ox) * STRIDE + $signed(kx) - PAD;
-                    
-                    input_ref_y <= input_y;
-                    input_ref_x <= input_x;
-                    
-                    // Enable MAC operation
-                    enable <= 1;
-                    
-                    // Broadcast input data (handle padding in memory controller)
-                    pe_data_in <= input_rdata;
-                end
-                
-                STATE_READ_OUT: begin
-                    // Latch output data
-                    output_valid <= 1;
-                    output_data  <= pe_acc_out;
-                end
-                
-                STATE_DONE: begin
+                S_DONE: begin
                     done <= 1;
+                    state <= S_IDLE;
                 end
             endcase
         end
     end
-    
+
 endmodule

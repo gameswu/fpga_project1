@@ -54,18 +54,18 @@ module pe_controller_tb;
     wire       weight_load;
     
     // PE Array Data Interface
-    wire [ARRAY_DIM*8-1:0]               pe_data_in;
-    wire [ARRAY_DIM*8-1:0]               pe_weight_in;
+    wire [ARRAY_DIM*ARRAY_DIM*8-1:0]     pe_data_in;
+    wire [ARRAY_DIM*ARRAY_DIM*8-1:0]     pe_weight_in;
     reg  [ARRAY_DIM*ARRAY_DIM*32-1:0]    pe_acc_out;
     
     // Weight Memory Interface
-    wire [15:0]            weight_addr;
-    reg  [ARRAY_DIM*8-1:0] weight_rdata;
+    wire [15:0]                          weight_addr;
+    reg  [ARRAY_DIM*ARRAY_DIM*8-1:0]     weight_rdata;
     
     // Input Memory Interface
-    wire signed [15:0]     input_ref_y;
-    wire signed [15:0]     input_ref_x;
-    reg  [ARRAY_DIM*8-1:0] input_rdata;
+    wire signed [15:0]                   input_ref_y;
+    wire signed [15:0]                   input_ref_x;
+    reg  [ARRAY_DIM*ARRAY_DIM*8-1:0]     input_rdata;
     
     // Output Interface
     wire                                output_valid;
@@ -129,17 +129,17 @@ module pe_controller_tb;
     
     // Weight Memory Model: Return all 1's (for simple testing)
     always @* begin
-        weight_rdata = {ARRAY_DIM{8'sd1}};  // 16 weights, each = 1
+        weight_rdata = {(ARRAY_DIM*ARRAY_DIM){8'sd1}};  // 256 weights, each = 1
     end
     
     // Input Memory Model: Return 1 if within bounds, 0 if padding
     always @* begin
         if (input_ref_y >= 0 && input_ref_y < IFM_H && 
             input_ref_x >= 0 && input_ref_x < IFM_W) begin
-            input_rdata = {ARRAY_DIM{8'sd1}};  // 16 pixels, each = 1
+            input_rdata = {(ARRAY_DIM*ARRAY_DIM){8'sd1}};  // 256 pixels, each = 1
         end
         else begin
-            input_rdata = {ARRAY_DIM{8'sd0}};  // Padding: return 0
+            input_rdata = {(ARRAY_DIM*ARRAY_DIM){8'sd0}};  // Padding: return 0
         end
     end
     
