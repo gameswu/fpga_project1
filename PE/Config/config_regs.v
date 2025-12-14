@@ -42,7 +42,9 @@ module config_regs (
     output reg  [7:0]  input_h,
     output reg  [7:0]  input_w,
     output reg  [3:0]  stride,
-    output reg  [3:0]  padding
+    output reg  [3:0]  padding,
+    output reg  [7:0]  output_h,
+    output reg  [7:0]  output_w
 );
 
     // Internal storage
@@ -51,6 +53,7 @@ module config_regs (
     reg [31:0] kernel_dim_reg;
     reg [31:0] input_dim_reg;
     reg [31:0] param_reg;
+    reg [31:0] output_dim_reg;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -58,6 +61,7 @@ module config_regs (
             kernel_dim_reg <= 0;
             input_dim_reg  <= 0;
             param_reg      <= 0;
+            output_dim_reg <= 0;
             
             start    <= 0;
             kernel_h <= 0;
@@ -66,6 +70,8 @@ module config_regs (
             input_w  <= 0;
             stride   <= 0;
             padding  <= 0;
+            output_h <= 0;
+            output_w <= 0;
         end else begin
             // Auto-clear start after 1 cycle (Pulse)
             if (start) start <= 0;
@@ -90,6 +96,11 @@ module config_regs (
                         param_reg <= reg_wdata;
                         stride    <= reg_wdata[3:0];
                         padding   <= reg_wdata[7:4];
+                    end
+                    4'h5: begin // Output Dims (Addr 0x14 -> Index 5)
+                        output_dim_reg <= reg_wdata;
+                        output_w <= reg_wdata[7:0];
+                        output_h <= reg_wdata[15:8];
                     end
                 endcase
             end

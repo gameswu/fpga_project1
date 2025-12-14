@@ -24,9 +24,11 @@ module tb_pe_top;
     parameter KW = 5;
     parameter IN_H = 10;
     parameter IN_W = 10;
+    parameter STRIDE = 2;
+    parameter PADDING = 1;
     
-    parameter OUT_H = IN_H - KH + 1;
-    parameter OUT_W = IN_W - KW + 1;
+    parameter OUT_H = (IN_H + 2*PADDING - KH) / STRIDE + 1;
+    parameter OUT_W = (IN_W + 2*PADDING - KW) / STRIDE + 1;
 
     // =========================================================================
     // Signals
@@ -119,11 +121,20 @@ module tb_pe_top;
             for (j=0; j<OUT_W; j=j+1) begin
                 for (l=0; l<COUT; l=l+1) begin
                     golden_output[i][j][l] = 0;
-                    for (m=0; m<KH; m=m+1)
-                        for (n=0; n<KW; n=n+1)
-                            for (k=0; k<CIN; k=k+1)
-                                golden_output[i][j][l] = golden_output[i][j][l] + 
-                                    (inputs[i+m][j+n][k] * weights[m][n][k][l]);
+                    for (m=0; m<KH; m=m+1) begin
+                        for (n=0; n<KW; n=n+1) begin
+                            for (k=0; k<CIN; k=k+1) begin
+                                integer iy, ix;
+                                iy = i*STRIDE + m - PADDING;
+                                ix = j*STRIDE + n - PADDING;
+                                
+                                if (iy >= 0 && iy < IN_H && ix >= 0 && ix < IN_W) begin
+                                    golden_output[i][j][l] = golden_output[i][j][l] + 
+                                        (inputs[iy][ix][k] * weights[m][n][k][l]);
+                                end
+                            end
+                        end
+                    end
                 end
             end
         end
@@ -181,6 +192,18 @@ module tb_pe_top;
         cfg_wdata = {16'b0, IN_H[7:0], IN_W[7:0]};
         cfg_we = 1;
         #10;
+        
+        // 0x10: Stride & Padding
+        cfg_addr = 4;
+        cfg_wdata = {24'b0, PADDING[3:0], STRIDE[3:0]};
+        cfg_we = 1;
+        #10;
+        
+        // 0x14: Output Dims
+        cfg_addr = 5;
+        cfg_wdata = {16'b0, OUT_H[7:0], OUT_W[7:0]};
+        cfg_we = 1;
+        #10;
         cfg_we = 0;
         
         // 6. Start
@@ -235,12 +258,14 @@ module tb_pe_top;
             for (oy=0; oy<OUT_H; oy=oy+1) begin
                 for (ox=0; ox<OUT_W; ox=ox+1) begin
                     // Read from Psum Buffer via res_data port
-                    // Address = oy*IN_W + ox (Same as controller logic)
-                    res_addr = oy*IN_W + ox;
+                    // Address = oy*OUT_W + ox (Controller uses output_w for stride)
+                    res_addr = oy*OUT_W + ox;
                     #10; // Wait for read
                     
                     for (c=0; c<COUT; c=c+1) begin
                         val = res_data[c*32 +: 32];
+                        // $display("Out(%0d, %0d) Ch %0d: Got %0d, Exp %0d", 
+                        //     oy, ox, c, val, golden_output[oy][ox][c]);
                         if (val !== golden_output[oy][ox][c]) begin
                             $display("ERROR at Out(%0d, %0d) Ch %0d: Exp %0d, Got %0d", 
                                 oy, ox, c, golden_output[oy][ox][c], val);

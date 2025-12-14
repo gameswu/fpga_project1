@@ -53,6 +53,8 @@ module pe_top (
     wire        done;
     wire [3:0]  kernel_h, kernel_w;
     wire [7:0]  input_h, input_w;
+    wire [3:0]  stride, padding;
+    wire [7:0]  output_h, output_w;
     
     // Controller -> Buffers
     wire [15:0] weight_mem_addr;
@@ -102,7 +104,11 @@ module pe_top (
         .kernel_h(kernel_h),
         .kernel_w(kernel_w),
         .input_h(input_h),
-        .input_w(input_w)
+        .input_w(input_w),
+        .stride(stride),
+        .padding(padding),
+        .output_h(output_h),
+        .output_w(output_w)
     );
     
     // 2. Weight Buffer
@@ -145,6 +151,10 @@ module pe_top (
         .kernel_w(kernel_w),
         .input_h(input_h),
         .input_w(input_w),
+        .stride(stride),
+        .padding(padding),
+        .output_h(output_h),
+        .output_w(output_w),
         .weight_write_enable(weight_write_enable),
         .weight_col(weight_col),
         .weight_data(weight_data),

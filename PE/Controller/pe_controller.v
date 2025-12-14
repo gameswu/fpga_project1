@@ -41,6 +41,10 @@ module pe_controller #(
     input  wire [3:0]  kernel_w,
     input  wire [7:0]  input_h,
     input  wire [7:0]  input_w,
+    input  wire [3:0]  stride,
+    input  wire [3:0]  padding,
+    input  wire [7:0]  output_h,
+    input  wire [7:0]  output_w,
     
     // PE Array Interface
     output reg         weight_write_enable,
@@ -94,6 +98,8 @@ module pe_controller #(
     reg [18:0] acc_clear_pipe;
     reg [9:0]  acc_addr_pipe [0:18];
     reg [4:0]  drain_cnt;
+    reg zero_input;
+    reg zero_input_d1;
     
     // Weight Loading Pipeline
     reg [3:0] wc_d1, wc_d2;
@@ -109,7 +115,11 @@ module pe_controller #(
             
             we_d1 <= 0; we_d2 <= 0;
             wc_d1 <= 0; wc_d2 <= 0;
+            zero_input <= 0;
+            zero_input_d1 <= 0;
         end else begin
+            zero_input_d1 <= zero_input;
+            
             // Shift Register for Accumulator
             for (p=18; p>0; p=p-1) begin
                 acc_enable_pipe[p] <= acc_enable_pipe[p-1];
@@ -151,6 +161,7 @@ module pe_controller #(
     // Continuous Data Capture
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) pe_data_in <= 0;
+        else if (zero_input_d1) pe_data_in <= 0;
         else pe_data_in <= input_mem_data;
     end
 
@@ -174,6 +185,14 @@ module pe_controller #(
             acc_enable_pipe[0] <= 0;
             acc_clear_pipe[0] <= 0;
             acc_addr_pipe[0] <= 0;
+            
+            // Default zero_input (cleared unless set)
+            // Wait, zero_input is a register, it holds value.
+            // But we want it to be controlled by state machine for the NEXT cycle.
+            // So we should set it in the state machine.
+            // But here we are inside the always block.
+            // Let's set default to 0.
+            zero_input <= 0;
             
             case (state)
                 S_IDLE: begin
@@ -226,30 +245,46 @@ module pe_controller #(
                 
                 S_STREAM_RUN: begin
                     // Drive Inputs
-                    // Convolution: Read Input at (oy+ky, ox+kx)
-                    // We assume input_mem is large enough.
-                    // Address = (oy + ky) * (input_w + kernel_w - 1) + (ox + kx) ?
-                    // No, let's assume the memory is organized as a 1D array of vectors.
-                    // And the "Stride" is the full input width.
-                    // Let's assume the user configures 'input_w' as the OUTPUT width for loop bounds,
-                    // but we need the TRUE input width for addressing.
-                    // For simplicity in this demo, let's assume Input Width = Output Width + Kernel Width - 1.
-                    // Or simpler: Just use a fixed stride or assume Input Width = input_w (and we handle padding/boundary externally).
+                    // Convolution: Read Input at (oy*stride + ky - padding, ox*stride + kx - padding)
                     
-                    // Let's stick to the simplest valid convolution logic:
-                    // We iterate oy, ox. We read Input[oy+ky][ox+kx].
-                    // We need to know the stride (Input Width).
-                    // Let's assume stride = input_w + kernel_w - 1 (Valid padding).
-                    // OR, let's just use (oy+ky) * 256 + (ox+kx) if we assume a large fixed stride?
-                    // No, let's use the provided input_w parameter as the stride, assuming it represents the full input width.
-                    // And we iterate oy up to (input_h - kernel_h + 1).
+                    // Calculate signed coordinates
+                    // We use 16-bit signed arithmetic
+                    // iy = oy * stride + ky - padding
+                    // ix = ox * stride + kx - padding
                     
-                    input_mem_addr <= (oy + ky) * input_w + (ox + kx);
+                    // Note: Verilog handles signed arithmetic if operands are signed.
+                    // Or we can manually handle it.
+                    // Let's use a temporary variable or expression.
+                    // Since we are inside a procedural block, we can't declare wires.
+                    // But we can use automatic variables or just expressions.
+                    
+                    // Let's use a large enough vector to hold the result and check MSB for negative.
+                    // oy (8b) * stride (4b) -> 12b. + ky (4b) -> 13b. - padding (4b) -> 14b signed.
+                    
+                    reg signed [15:0] iy_s;
+                    reg signed [15:0] ix_s;
+                    
+                    iy_s = $signed({8'b0, oy}) * $signed({12'b0, stride}) + $signed({12'b0, ky}) - $signed({12'b0, padding});
+                    ix_s = $signed({8'b0, ox}) * $signed({12'b0, stride}) + $signed({12'b0, kx}) - $signed({12'b0, padding});
+                    
+                    if (iy_s >= 0 && iy_s < $signed({8'b0, input_h}) && ix_s >= 0 && ix_s < $signed({8'b0, input_w})) begin
+                        input_mem_addr <= iy_s * input_w + ix_s;
+                        zero_input <= 0;
+                    end else begin
+                        input_mem_addr <= 0;
+                        zero_input <= 1;
+                    end
+                    
+                    // Debug
+                    // $display("Time %t: oy=%d ox=%d ky=%d kx=%d -> iy=%d ix=%d (Valid: %b) Addr=%d Zero=%b", 
+                    //     $time, oy, ox, ky, kx, iy_s, ix_s, 
+                    //     (iy_s >= 0 && iy_s < $signed({8'b0, input_h}) && ix_s >= 0 && ix_s < $signed({8'b0, input_w})),
+                    //     (iy_s * input_w + ix_s), zero_input);
                     
                     // Accumulator Control
                     // We accumulate into (oy, ox)
                     acc_enable_pipe[0] <= 1;
-                    acc_addr_pipe[0] <= oy * input_w + ox; // Use same stride for output for now
+                    acc_addr_pipe[0] <= oy * output_w + ox; // Use output_w for stride
                     
                     if (ky == 0 && kx == 0) 
                         acc_clear_pipe[0] <= 1;
@@ -257,12 +292,10 @@ module pe_controller #(
                         acc_clear_pipe[0] <= 0;
                         
                     // Loop Spatial
-                    // We iterate up to input_w - kernel_w?
-                    // Let's assume the state machine iterates over the VALID output range.
-                    // For this specific testbench, we will control input_h/w to be the output size.
-                    if (ox == input_w - kernel_w) begin // Simple boundary check for "Valid" convolution
+                    // Iterate over Output Dimensions
+                    if (ox == output_w - 1) begin
                         ox <= 0;
-                        if (oy == input_h - kernel_h) begin
+                        if (oy == output_h - 1) begin
                             state <= S_NEXT_KERNEL;
                         end else begin
                             oy <= oy + 1;
