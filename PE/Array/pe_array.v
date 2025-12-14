@@ -31,10 +31,10 @@ module pe_array #(
     input wire rst_n,
     
     // Weight Loading Interface
-    input wire weight_we,
-    input wire [3:0] weight_row,
+    input wire weight_write_enable,
+    // input wire [3:0] weight_row, // Removed: Loading whole column at once
     input wire [3:0] weight_col,
-    input wire [DATA_WIDTH-1:0] weight_in,
+    input wire [ARRAY_DIM*DATA_WIDTH-1:0] weight_in,
     
     // Data Inputs (Vector of 16 bytes)
     // data_in[0] -> Row 0 (Input Channel 0)
@@ -105,7 +105,9 @@ module pe_array #(
             for (c = 0; c < ARRAY_DIM; c = c + 1) begin : COLS
                 
                 // Weight Load Logic for this PE
-                wire pe_load = weight_we && (weight_row == r[3:0]) && (weight_col == c[3:0]);
+                // Load entire column 'weight_col' at once.
+                // Each PE in this column takes its slice of weight_in.
+                wire pe_load = weight_write_enable && (weight_col == c[3:0]);
                 
                 mac u_mac (
                     .clk(clk),
@@ -113,8 +115,8 @@ module pe_array #(
                     .weight_load(pe_load),
                     // Input Data (Skewed)
                     .data_in(row_data_in[r]),
-                    // Weight Data (From common input)
-                    .weight_in(weight_in),
+                    // Weight Data (From common input vector, sliced for this row)
+                    .weight_in(weight_in[r*DATA_WIDTH +: DATA_WIDTH]),
                     // Partial Sum Input (From PE above)
                     .psum_in(psum_inter[r][c]),
                     // Partial Sum Output (To PE below)

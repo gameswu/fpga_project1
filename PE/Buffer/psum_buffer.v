@@ -82,13 +82,4 @@ module psum_buffer #(
     // Output the value (Read mode)
     assign final_out = rdata;
 
-    always @(posedge clk) begin
-        if (acc_enable) begin
-            //$display("Buffer Write: Addr=%d, DataIn[0]=%d, MemBefore[0]=%d", addr, psum_in[31:0], mem[addr][31:0]);
-        end
-        // if (addr == 0) begin
-        //    $display("Buffer Read: Addr=%d, RData[0]=%d", addr, rdata[31:0]);
-        // end
-    end
-
 endmodule

@@ -59,11 +59,15 @@ CTRL_TB    = $(CONTROLLER_DIR)/pe_controller_tb.v
 
 # Convolution Testbench
 CONV_TB    = $(SRC_DIR)/tb_conv_16x16.v
+SYSTEM_TB  = $(SRC_DIR)/tb_pe_top.v
 
 # Other modules
 CONFIG_SRC = $(CONFIG_DIR)/config_regs.v
 BUFFER_SRC = $(BUFFER_DIR)/input_loader.v
 PSUM_BUF_SRC = $(BUFFER_DIR)/psum_buffer.v
+WEIGHT_BUF_SRC = $(BUFFER_DIR)/weight_buffer.v
+ACT_BUF_SRC = $(BUFFER_DIR)/act_buffer.v
+PE_TOP_SRC = $(SRC_DIR)/pe_top.v
 PPU_SRC    = $(PPU_DIR)/requantizer.v
 
 # =========================================================================
@@ -73,19 +77,21 @@ OUT_MAC    = $(BUILD_DIR)/mac_sim
 OUT_ARRAY  = $(BUILD_DIR)/pe_array_sim
 OUT_CTRL   = $(BUILD_DIR)/pe_controller_sim
 OUT_CONV   = $(BUILD_DIR)/sim_conv
+OUT_SYSTEM = $(BUILD_DIR)/sim_system
 
 VCD_MAC    = $(WAVE_DIR)/mac_tb.vcd
 VCD_ARRAY  = $(WAVE_DIR)/pe_array_tb.vcd
 VCD_CTRL   = $(WAVE_DIR)/pe_controller_tb.vcd
 VCD_CONV   = $(WAVE_DIR)/tb_conv_16x16.vcd
+VCD_SYSTEM = $(WAVE_DIR)/tb_pe_top.vcd
 
 # =========================================================================
 # Phony Targets
 # =========================================================================
-.PHONY: all clean mac pe_array pe_controller conv_test view_mac view_array view_ctrl help dirs
+.PHONY: all clean mac pe_array pe_controller conv_test system_test view_mac view_array view_ctrl help dirs
 
 # Default target
-all: mac pe_array pe_controller conv_test
+all: system_test
 
 # Help message
 help:
@@ -179,6 +185,22 @@ conv_test: dirs $(OUT_CONV)
 $(OUT_CONV): $(CONV_TB) $(CTRL_SRC) $(ARRAY_SRC) $(MAC_SRC) $(PSUM_BUF_SRC)
 	@echo "Compiling Convolution Test..."
 	$(IVERILOG) $(IVFLAGS) -o $(OUT_CONV) $(CONV_TB) $(CTRL_SRC) $(ARRAY_SRC) $(MAC_SRC) $(PSUM_BUF_SRC)
+
+# =========================================================================
+# System Test (PE Top)
+# =========================================================================
+system_test: dirs $(OUT_SYSTEM)
+	@echo "=========================================="
+	@echo "Running PE System Test"
+	@echo "=========================================="
+	$(VVP) $(VVPFLAGS) $(OUT_SYSTEM)
+	@if [ -f tb_pe_top.vcd ]; then mv tb_pe_top.vcd $(VCD_SYSTEM); fi
+	@echo "Waveform saved to $(VCD_SYSTEM)"
+	@echo ""
+
+$(OUT_SYSTEM): $(SYSTEM_TB) $(PE_TOP_SRC) $(CONFIG_SRC) $(WEIGHT_BUF_SRC) $(ACT_BUF_SRC) $(CTRL_SRC) $(ARRAY_SRC) $(MAC_SRC) $(PSUM_BUF_SRC)
+	@echo "Compiling System Test..."
+	$(IVERILOG) $(IVFLAGS) -o $(OUT_SYSTEM) $(SYSTEM_TB) $(PE_TOP_SRC) $(CONFIG_SRC) $(WEIGHT_BUF_SRC) $(ACT_BUF_SRC) $(CTRL_SRC) $(ARRAY_SRC) $(MAC_SRC) $(PSUM_BUF_SRC)
 
 # =========================================================================
 # Clean Target

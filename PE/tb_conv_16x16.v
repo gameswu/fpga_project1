@@ -22,8 +22,8 @@ module tb_conv_16x16;
     // =========================================================================
     // Parameters
     // =========================================================================
-    parameter CIN = 16;
-    parameter COUT = 16;
+    parameter CIN = 10;
+    parameter COUT = 10;
     parameter KH = 3;
     parameter KW = 3;
     parameter IN_H = 8;
@@ -257,6 +257,8 @@ module tb_conv_16x16;
         for (oy_chk=0; oy_chk<OUT_H; oy_chk=oy_chk+1) begin
             for (ox_chk=0; ox_chk<OUT_W; ox_chk=ox_chk+1) begin
                 for (c_chk=0; c_chk<COUT; c_chk=c_chk+1) begin
+                        $display("Checking Out(%0d, %0d) Ch %0d: Expected %0d, Got %0d", 
+                        oy_chk, ox_chk, c_chk, golden_output[oy_chk][ox_chk][c_chk], $signed(u_buffer.mem[oy_chk*IN_W + ox_chk][c_chk*32 +: 32]));
                     if (u_buffer.mem[oy_chk*IN_W + ox_chk][c_chk*32 +: 32] !== golden_output[oy_chk][ox_chk][c_chk]) begin
                         $display("ERROR at Out(%0d, %0d) Ch %0d: Exp %0d, Got %0d", 
                             oy_chk, ox_chk, c_chk, golden_output[oy_chk][ox_chk][c_chk], $signed(u_buffer.mem[oy_chk*IN_W + ox_chk][c_chk*32 +: 32]));

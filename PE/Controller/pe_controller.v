@@ -43,10 +43,9 @@ module pe_controller #(
     input  wire [7:0]  input_w,
     
     // PE Array Interface
-    output reg         weight_we,
-    output reg  [3:0]  weight_row,
+    output reg         weight_write_enable,
     output reg  [3:0]  weight_col,
-    output reg  [7:0]  weight_data,
+    output reg  [ARRAY_DIM*8-1:0]  weight_data,
     output reg  [ARRAY_DIM*8-1:0] pe_data_in, // Broadcast to rows
     
     // Accumulator / Buffer Interface
@@ -57,7 +56,7 @@ module pe_controller #(
     
     // External Memory Interface (Simplified)
     output reg  [15:0] weight_mem_addr,
-    input  wire [31:0] weight_mem_data,
+    input  wire [ARRAY_DIM*8-1:0] weight_mem_data,
     
     output reg  [15:0] input_mem_addr,
     input  wire [ARRAY_DIM*8-1:0] input_mem_data // Vector of 16 bytes
@@ -84,19 +83,20 @@ module pe_controller #(
     reg [7:0] oy, ox; // Output Y, Output X
     
     // Weight Loading Counters
-    reg [3:0] wr, wc;
+    reg [3:0] wc;
     
     // Pipeline Delay Logic
     // Array Latency = 16 cycles (1 reg per row)
-    // Memory Read Latency = 3 cycles (Addr->Mem->Reg->Valid)
-    // Total Latency = 19 cycles.
+    // Memory Read Latency = 1 cycle (Addr->Mem->Reg)
+    // Total Latency = 17 cycles.
+    // We need index 18 (depth 19) to align T+1 to T+19.
     reg [18:0] acc_enable_pipe;
     reg [18:0] acc_clear_pipe;
     reg [9:0]  acc_addr_pipe [0:18];
     reg [4:0]  drain_cnt;
     
     // Weight Loading Pipeline
-    reg [3:0] wr_d1, wc_d1, wr_d2, wc_d2;
+    reg [3:0] wc_d1, wc_d2;
     reg we_d1, we_d2;
     reg [1:0] load_wait_cnt;
 
@@ -108,8 +108,7 @@ module pe_controller #(
             for (p=0; p<19; p=p+1) acc_addr_pipe[p] <= 0;
             
             we_d1 <= 0; we_d2 <= 0;
-            wr_d1 <= 0; wc_d1 <= 0;
-            wr_d2 <= 0; wc_d2 <= 0;
+            wc_d1 <= 0; wc_d2 <= 0;
         end else begin
             // Shift Register for Accumulator
             for (p=18; p>0; p=p-1) begin
@@ -122,35 +121,30 @@ module pe_controller #(
             // Input to d1 comes from current state (wr, wc)
             // Only valid during LOAD_WEIGHT_LOOP
             we_d1 <= (state == S_LOAD_WEIGHT_LOOP);
-            wr_d1 <= wr;
             wc_d1 <= wc;
             
             we_d2 <= we_d1;
-            wr_d2 <= wr_d1;
             wc_d2 <= wc_d1;
         end
     end
     
     // Output the delayed signals
     always @(*) begin
-        acc_enable = acc_enable_pipe[18]; // Delayed by 19
+        acc_enable = acc_enable_pipe[18]; // Delayed by 18 cycles relative to pipe[0] (Total 19 from start)
         acc_clear = acc_clear_pipe[18];
         acc_addr = acc_addr_pipe[18];
-        if (acc_enable === 1'bx) $display("Time %t: acc_enable is X!", $time);
     end
     
     // Drive Weight Outputs from Pipeline
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            weight_we <= 0;
-            weight_row <= 0;
+            weight_write_enable <= 0;
             weight_col <= 0;
             weight_data <= 0;
         end else begin
-            weight_we <= we_d2;
-            weight_row <= wr_d2;
+            weight_write_enable <= we_d2;
             weight_col <= wc_d2;
-            weight_data <= weight_mem_data[7:0]; // Captures data corresponding to address at T-2
+            weight_data <= weight_mem_data; // Captures full column
         end
     end
     
@@ -166,13 +160,15 @@ module pe_controller #(
             done <= 0;
             ky <= 0; kx <= 0;
             oy <= 0; ox <= 0;
-            wr <= 0; wc <= 0;
+            wc <= 0;
             drain_cnt <= 0;
             load_wait_cnt <= 0;
+            weight_mem_addr <= 0;
+            input_mem_addr <= 0;
         end else begin
             // Defaults
-            // weight_we <= 0; // Removed, driven by separate block
-            done <= 0;
+            // weight_write_enable <= 0; // Removed, driven by separate block
+            // done <= 0; // Removed to allow sticky done
             
             // Default pipe input (0 unless overridden)
             acc_enable_pipe[0] <= 0;
@@ -184,6 +180,7 @@ module pe_controller #(
                     if (start) begin
                         state <= S_LOAD_WEIGHT_INIT;
                         ky <= 0; kx <= 0;
+                        done <= 0; // Clear done on start
                     end
                 end
                 
@@ -191,24 +188,20 @@ module pe_controller #(
                 // 1. Load Weights for current (ky, kx) slice
                 // -------------------------------------------------------------
                 S_LOAD_WEIGHT_INIT: begin
-                    wr <= 0; wc <= 0;
+                    wc <= 0;
                     state <= S_LOAD_WEIGHT_LOOP;
                 end
                 
                 S_LOAD_WEIGHT_LOOP: begin
-                    // Fetch weight from memory
-                    weight_mem_addr <= (ky * kernel_w + kx) * 256 + wr * 16 + wc;
+                    // Fetch weight from memory (Column-wise)
+                    weight_mem_addr <= (ky * kernel_w + kx) * 16 + wc;
                     
                     // Outputs are driven by pipeline registers
                     
                     if (wc == 15) begin
                         wc <= 0;
-                        if (wr == 15) begin
-                            state <= S_LOAD_WEIGHT_WAIT; // Wait for pipeline to drain
-                            load_wait_cnt <= 0;
-                        end else begin
-                            wr <= wr + 1;
-                        end
+                        state <= S_LOAD_WEIGHT_WAIT; // Wait for pipeline to drain
+                        load_wait_cnt <= 0;
                     end else begin
                         wc <= wc + 1;
                     end
@@ -253,8 +246,6 @@ module pe_controller #(
                     
                     input_mem_addr <= (oy + ky) * input_w + (ox + kx);
                     
-                    if (input_mem_data === 128'bx) $display("Time %t: input_mem_data is X at addr %d", $time, (oy + ky) * input_w + (ox + kx));
-                    
                     // Accumulator Control
                     // We accumulate into (oy, ox)
                     acc_enable_pipe[0] <= 1;
@@ -295,7 +286,7 @@ module pe_controller #(
                     // But we ARE overwriting weights.
                     // So we MUST wait for the pipeline to drain (16 cycles).
                     
-                    if (drain_cnt == 16) begin
+                    if (drain_cnt == 20) begin
                         drain_cnt <= 0;
                         if (kx == kernel_w - 1) begin
                             kx <= 0;

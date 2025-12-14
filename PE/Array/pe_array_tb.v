@@ -27,7 +27,7 @@ module pe_array_tb;
     ) dut (
         .clk(clk),
         .rst_n(rst_n),
-        .enable(enable),
+        .weight_write_enable(enable),
         .acc_clear(acc_clear),
         .weight_load(weight_load),
         .data_in(data_in),
