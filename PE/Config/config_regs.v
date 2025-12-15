@@ -31,7 +31,7 @@ module config_regs (
     input  wire        reg_write,
     input  wire [3:0]  reg_addr, // 4-bit address for few registers
     input  wire [31:0] reg_wdata,
-    output reg  [31:0] reg_rdata,
+    output wire [31:0] reg_rdata,
     
     // Hardware Interface (To Controller)
     output reg         start,
@@ -108,15 +108,18 @@ module config_regs (
     end
     
     // Read Logic
+    reg [31:0] reg_rdata_comb;
     always @(*) begin
         case (reg_addr)
-            4'h0: reg_rdata = {31'b0, start}; // Reflects current state
-            4'h1: reg_rdata = {31'b0, done};
-            4'h2: reg_rdata = kernel_dim_reg;
-            4'h3: reg_rdata = input_dim_reg;
-            4'h4: reg_rdata = param_reg;
-            default: reg_rdata = 32'd0;
+            4'h0: reg_rdata_comb = {31'b0, start}; // Reflects current state
+            4'h1: reg_rdata_comb = {31'b0, done};
+            4'h2: reg_rdata_comb = kernel_dim_reg;
+            4'h3: reg_rdata_comb = input_dim_reg;
+            4'h4: reg_rdata_comb = param_reg;
+            default: reg_rdata_comb = 32'd0;
         endcase
     end
+    
+    assign reg_rdata = reg_rdata_comb;
 
 endmodule

@@ -53,9 +53,9 @@ module pe_controller #(
     output reg  [ARRAY_DIM*8-1:0] pe_data_in, // Broadcast to rows
     
     // Accumulator / Buffer Interface
-    output reg         acc_enable,
-    output reg         acc_clear,
-    output reg  [9:0]  acc_addr,
+    output wire        acc_enable,
+    output wire        acc_clear,
+    output wire [9:0]  acc_addr,
     input  wire [ARRAY_DIM*32-1:0] pe_acc_out, // From Array (Bottom)
     
     // External Memory Interface (Simplified)
@@ -94,8 +94,8 @@ module pe_controller #(
     // Memory Read Latency = 1 cycle (Addr->Mem->Reg)
     // Total Latency = 17 cycles.
     // We need index 18 (depth 19) to align T+1 to T+19.
-    reg [18:0] acc_enable_pipe;
-    reg [18:0] acc_clear_pipe;
+    reg acc_enable_pipe [0:18];  // 19-stage shift register
+    reg acc_clear_pipe [0:18];   // 19-stage shift register
     reg [9:0]  acc_addr_pipe [0:18];
     reg [4:0]  drain_cnt;
     reg zero_input;
@@ -109,13 +109,20 @@ module pe_controller #(
     // Coordinate calculation temporary variables
     reg signed [15:0] iy_s;
     reg signed [15:0] ix_s;
+    
+    // Next-cycle values for pipeline input (set by state machine)
+    reg acc_enable_next;
+    reg acc_clear_next;
+    reg [9:0] acc_addr_next;
 
     integer p;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            acc_enable_pipe <= 0;
-            acc_clear_pipe <= 0;
-            for (p=0; p<19; p=p+1) acc_addr_pipe[p] <= 0;
+            for (p=0; p<19; p=p+1) begin
+                acc_enable_pipe[p] <= 0;
+                acc_clear_pipe[p] <= 0;
+                acc_addr_pipe[p] <= 0;
+            end
             
             we_d1 <= 0; we_d2 <= 0;
             wc_d1 <= 0; wc_d2 <= 0;
@@ -125,6 +132,12 @@ module pe_controller #(
             zero_input_d1 <= zero_input;
             
             // Shift Register for Accumulator
+            // Update pipe[0] from next-cycle signals set by state machine
+            acc_enable_pipe[0] <= acc_enable_next;
+            acc_clear_pipe[0] <= acc_clear_next;
+            acc_addr_pipe[0] <= acc_addr_next;
+            
+            // Shift remaining stages
             for (p=18; p>0; p=p-1) begin
                 acc_enable_pipe[p] <= acc_enable_pipe[p-1];
                 acc_clear_pipe[p] <= acc_clear_pipe[p-1];
@@ -143,11 +156,9 @@ module pe_controller #(
     end
     
     // Output the delayed signals
-    always @(*) begin
-        acc_enable = acc_enable_pipe[18]; // Delayed by 18 cycles relative to pipe[0] (Total 19 from start)
-        acc_clear = acc_clear_pipe[18];
-        acc_addr = acc_addr_pipe[18];
-    end
+    assign acc_enable = acc_enable_pipe[18]; // Delayed by 18 cycles relative to pipe[0] (Total 19 from start)
+    assign acc_clear = acc_clear_pipe[18];
+    assign acc_addr = acc_addr_pipe[18];
     
     // Drive Weight Outputs from Pipeline
     always @(posedge clk or negedge rst_n) begin
@@ -186,9 +197,9 @@ module pe_controller #(
             // done <= 0; // Removed to allow sticky done
             
             // Default pipe input (0 unless overridden)
-            acc_enable_pipe[0] <= 0;
-            acc_clear_pipe[0] <= 0;
-            acc_addr_pipe[0] <= 0;
+            acc_enable_next = 0;
+            acc_clear_next = 0;
+            acc_addr_next = 0;
             
             // Default zero_input (cleared unless set)
             // Wait, zero_input is a register, it holds value.
@@ -275,13 +286,13 @@ module pe_controller #(
                     
                     // Accumulator Control
                     // We accumulate into (oy, ox)
-                    acc_enable_pipe[0] <= 1;
-                    acc_addr_pipe[0] <= oy * output_w + ox; // Use output_w for stride
+                    acc_enable_next = 1;
+                    acc_addr_next = oy * output_w + ox; // Use output_w for stride
                     
                     if (ky == 0 && kx == 0) 
-                        acc_clear_pipe[0] <= 1;
+                        acc_clear_next = 1;
                     else 
-                        acc_clear_pipe[0] <= 0;
+                        acc_clear_next = 0;
                         
                     // Loop Spatial
                     // Iterate over Output Dimensions
@@ -301,7 +312,7 @@ module pe_controller #(
                 // 3. Next Kernel Slice
                 // -------------------------------------------------------------
                 S_NEXT_KERNEL: begin
-                    acc_enable_pipe[0] <= 0; // Ensure disabled
+                    acc_enable_next = 0; // Ensure disabled
                     
                     // Wait for pipeline to drain?
                     // The controller moves to LOAD_WEIGHT immediately.
