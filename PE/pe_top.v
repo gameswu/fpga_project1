@@ -35,7 +35,9 @@ module pe_top (
     output wire [15:0] input_mem_addr,
     input  wire [127:0] input_mem_data,
     
-    // Partial Sum Buffer Interface (Write-only for final results)
+    // Partial Sum Buffer Interface (Read-Modify-Write)
+    output wire [9:0]  psum_raddr,         // Read address
+    input  wire [511:0] psum_rdata,        // Read data
     output wire [9:0]  psum_waddr,         // Write address
     output wire [511:0] psum_wdata,        // Write data (final results from PE array)
     output wire        psum_wen            // Write enable
@@ -143,37 +145,27 @@ module pe_top (
     // =========================================================================
     // Partial Sum Output Logic
     // =========================================================================
-    // PE array already performs accumulation internally via MAC psum_in/out chain.
-    // Here we just write the final results to external BRAM.
-    // Add pipeline delay to match timing requirements.
+    // Accumulation logic moved to psum_accumulator.
+    // Handles Read-Modify-Write with external BRAM.
     
-    reg [9:0]   psum_addr_d1, psum_addr_d2;
-    reg         psum_enable_d1, psum_enable_d2;
-    reg [511:0] psum_data_d1, psum_data_d2;
+    // Drive Read Address directly from Controller
+    assign psum_raddr = psum_acc_addr;
     
-    always @(posedge clk) begin
-        if (!rst_n) begin
-            psum_addr_d1 <= 0;
-            psum_addr_d2 <= 0;
-            psum_enable_d1 <= 0;
-            psum_enable_d2 <= 0;
-            psum_data_d1 <= 0;
-            psum_data_d2 <= 0;
-        end else begin
-            // 2-stage pipeline for timing
-            psum_addr_d1 <= psum_acc_addr;
-            psum_enable_d1 <= psum_acc_enable;
-            psum_data_d1 <= pe_acc_out;
-            
-            psum_addr_d2 <= psum_addr_d1;
-            psum_enable_d2 <= psum_enable_d1;
-            psum_data_d2 <= psum_data_d1;
-        end
-    end
-    
-    // Connect to external BRAM (delayed signals)
-    assign psum_waddr = psum_addr_d2;
-    assign psum_wdata = psum_data_d2;
-    assign psum_wen = psum_enable_d2;
+    psum_accumulator #(
+        .ARRAY_DIM(16),
+        .ACC_WIDTH(32),
+        .ADDR_WIDTH(10)
+    ) u_psum_acc (
+        .clk(clk),
+        .rst_n(rst_n),
+        .acc_enable(psum_acc_enable),
+        .acc_clear(psum_acc_clear),
+        .addr_in(psum_acc_addr),
+        .psum_in(pe_acc_out),
+        .rdata(psum_rdata),
+        .waddr(psum_waddr),
+        .wdata(psum_wdata),
+        .wen(psum_wen)
+    );
 
 endmodule
