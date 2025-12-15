@@ -105,6 +105,10 @@ module pe_controller #(
     reg [3:0] wc_d1, wc_d2;
     reg we_d1, we_d2;
     reg [1:0] load_wait_cnt;
+    
+    // Coordinate calculation temporary variables
+    reg signed [15:0] iy_s;
+    reg signed [15:0] ix_s;
 
     integer p;
     always @(posedge clk or negedge rst_n) begin
@@ -251,18 +255,6 @@ module pe_controller #(
                     // We use 16-bit signed arithmetic
                     // iy = oy * stride + ky - padding
                     // ix = ox * stride + kx - padding
-                    
-                    // Note: Verilog handles signed arithmetic if operands are signed.
-                    // Or we can manually handle it.
-                    // Let's use a temporary variable or expression.
-                    // Since we are inside a procedural block, we can't declare wires.
-                    // But we can use automatic variables or just expressions.
-                    
-                    // Let's use a large enough vector to hold the result and check MSB for negative.
-                    // oy (8b) * stride (4b) -> 12b. + ky (4b) -> 13b. - padding (4b) -> 14b signed.
-                    
-                    reg signed [15:0] iy_s;
-                    reg signed [15:0] ix_s;
                     
                     iy_s = $signed({8'b0, oy}) * $signed({12'b0, stride}) + $signed({12'b0, ky}) - $signed({12'b0, padding});
                     ix_s = $signed({8'b0, ox}) * $signed({12'b0, stride}) + $signed({12'b0, kx}) - $signed({12'b0, padding});

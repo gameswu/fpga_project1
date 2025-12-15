@@ -2,11 +2,13 @@
  * PE System Top Level
  * 
  * Description:
- *   Integrates the PE Controller, PE Array, Buffers, and Configuration Registers.
- *   Provides a unified interface for configuration and data loading.
+ *   Integrates the PE Controller, PE Array, and Configuration Registers.
+ *   Buffers are external (connected via BRAM IPs in Block Design).
+ *   Provides computation engine with external memory interfaces.
  *
  * Author: shelligh
  * Date: 2025-12-11
+ * Modified: 2025-12-15 - Externalized buffers to Block Design BRAM IPs
  */
 
 module pe_top (
@@ -22,26 +24,21 @@ module pe_top (
     output wire [31:0] cfg_rdata,
     
     // =========================================================================
-    // Weight Loader Interface
+    // External Buffer Interfaces (Connected to BRAM IPs in Block Design)
     // =========================================================================
-    input  wire        weight_load_we,
-    input  wire [15:0] weight_load_addr,
-    input  wire [127:0] weight_load_data,
     
-    // =========================================================================
-    // Activation Loader Interface
-    // =========================================================================
-    input  wire        act_load_we,
-    input  wire [15:0] act_load_addr,
-    input  wire [127:0] act_load_data,
+    // Weight Buffer Interface (Controller side - Read only)
+    output wire [15:0] weight_mem_addr,
+    input  wire [127:0] weight_mem_data,
     
-    // =========================================================================
-    // Result Interface (Partial Sum Buffer Readout)
-    // =========================================================================
-    // For simplicity, we expose the buffer read port directly or via a bus?
-    // Let's expose a simple read port for the testbench.
-    input  wire [9:0]   res_addr,
-    output wire [511:0] res_data // 16 * 32-bit
+    // Activation Buffer Interface (Controller side - Read only)
+    output wire [15:0] input_mem_addr,
+    input  wire [127:0] input_mem_data,
+    
+    // Partial Sum Buffer Interface (Write-only for final results)
+    output wire [9:0]  psum_waddr,         // Write address
+    output wire [511:0] psum_wdata,        // Write data (final results from PE array)
+    output wire        psum_wen            // Write enable
 );
 
     // =========================================================================
@@ -56,36 +53,19 @@ module pe_top (
     wire [3:0]  stride, padding;
     wire [7:0]  output_h, output_w;
     
-    // Controller -> Buffers
-    wire [15:0] weight_mem_addr;
-    wire [16*8-1:0] weight_mem_data;
-    
-    wire [15:0] input_mem_addr;
-    wire [127:0] input_mem_data;
-    
     // Controller -> Array
     wire        weight_write_enable;
     wire [3:0]  weight_col;
     wire [8*16-1:0]  weight_data;
     wire [127:0] pe_data_in;
     
-    // Controller -> Psum Buffer
-    wire        acc_enable;
-    wire        acc_clear;
-    wire [9:0]  acc_addr;
+    // Controller -> Psum
+    wire        psum_acc_enable;
+    wire        psum_acc_clear;
+    wire [9:0]  psum_acc_addr;
     
-    // Mux for Psum Buffer Address
-    wire [9:0]  psum_buf_addr;
-    assign psum_buf_addr = (done) ? res_addr : acc_addr;
-
-    // Array -> Psum Buffer
-    wire [511:0] pe_acc_out; // 16 * 32
-    
-    // Psum Buffer -> Array (Feedback? No, Psum Buffer is the accumulator)
-    // The array outputs psum_out. The buffer accumulates it.
-    // Wait, the array is Weight Stationary. It produces partial sums.
-    // The buffer reads old psum, adds new psum, writes back.
-    // The buffer logic is inside psum_buffer.v.
+    // Array -> Psum accumulator
+    wire [511:0] pe_acc_out; // 16 * 32 (PE Array output)
     
     // =========================================================================
     // Module Instantiations
@@ -111,35 +91,10 @@ module pe_top (
         .output_w(output_w)
     );
     
-    // 2. Weight Buffer
-    weight_buffer #(
-        .DATA_WIDTH(128),
-        .ADDR_WIDTH(16),
-        .DEPTH(65536)
-    ) u_weight_buf (
-        .clk(clk),
-        .we_a(weight_load_we),
-        .addr_a(weight_load_addr),
-        .wdata_a(weight_load_data),
-        .addr_b(weight_mem_addr),
-        .rdata_b(weight_mem_data)
-    );
-    
-    // 3. Activation Buffer
-    act_buffer #(
-        .DATA_WIDTH(128),
-        .ADDR_WIDTH(16),
-        .DEPTH(65536)
-    ) u_act_buf (
-        .clk(clk),
-        .we_a(act_load_we),
-        .addr_a(act_load_addr),
-        .wdata_a(act_load_data),
-        .addr_b(input_mem_addr),
-        .rdata_b(input_mem_data)
-    );
-    
-    // 4. PE Controller
+    // =========================================================================
+    // PE Controller
+    // =========================================================================
+    // Note: Buffers are external BRAM IPs connected via top-level ports
     pe_controller #(
         .ARRAY_DIM(16)
     ) u_controller (
@@ -159,13 +114,10 @@ module pe_top (
         .weight_col(weight_col),
         .weight_data(weight_data),
         .pe_data_in(pe_data_in),
-        .acc_enable(acc_enable),
-        .acc_clear(acc_clear),
-        .acc_addr(acc_addr),
-        .pe_acc_out(pe_acc_out), // This is actually INPUT to controller? No, controller doesn't take psum.
-                                 // Controller generates addresses.
-                                 // Wait, pe_controller definition has 'input [..] pe_acc_out'.
-                                 // Let's check pe_controller.v again.
+        .acc_enable(psum_acc_enable),
+        .acc_clear(psum_acc_clear),
+        .acc_addr(psum_acc_addr),
+        .pe_acc_out(pe_acc_out),
         .weight_mem_addr(weight_mem_addr),
         .weight_mem_data(weight_mem_data),
         .input_mem_addr(input_mem_addr),
@@ -187,28 +139,41 @@ module pe_top (
         .psum_out(pe_acc_out)
     );
     
-    // 6. Partial Sum Buffer
-    psum_buffer #(
-        .ARRAY_DIM(16),
-        .ACC_WIDTH(32),
-        .DEPTH(1024)
-    ) u_psum_buf (
-        .clk(clk),
-        .rst_n(rst_n),
-        .acc_enable(acc_enable),
-        .acc_clear(acc_clear),
-        .addr(psum_buf_addr),
-        .psum_in(pe_acc_out),
-        .final_out(res_data)
-    );
+    // =========================================================================
+    // =========================================================================
+    // Partial Sum Output Logic
+    // =========================================================================
+    // PE array already performs accumulation internally via MAC psum_in/out chain.
+    // Here we just write the final results to external BRAM.
+    // Add pipeline delay to match timing requirements.
     
-    // Note: pe_controller has an input 'pe_acc_out'.
-    // In the previous testbench, it was connected to the array output.
-    // But the controller doesn't seem to USE it?
-    // Let's check pe_controller.v.
-    // It has: input wire [ARRAY_DIM*32-1:0] pe_acc_out
-    // But inside the module, is it used?
-    // I suspect it's unused or used for monitoring.
-    // I'll connect it to pe_acc_out (from array) just in case.
+    reg [9:0]   psum_addr_d1, psum_addr_d2;
+    reg         psum_enable_d1, psum_enable_d2;
+    reg [511:0] psum_data_d1, psum_data_d2;
+    
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            psum_addr_d1 <= 0;
+            psum_addr_d2 <= 0;
+            psum_enable_d1 <= 0;
+            psum_enable_d2 <= 0;
+            psum_data_d1 <= 0;
+            psum_data_d2 <= 0;
+        end else begin
+            // 2-stage pipeline for timing
+            psum_addr_d1 <= psum_acc_addr;
+            psum_enable_d1 <= psum_acc_enable;
+            psum_data_d1 <= pe_acc_out;
+            
+            psum_addr_d2 <= psum_addr_d1;
+            psum_enable_d2 <= psum_enable_d1;
+            psum_data_d2 <= psum_data_d1;
+        end
+    end
+    
+    // Connect to external BRAM (delayed signals)
+    assign psum_waddr = psum_addr_d2;
+    assign psum_wdata = psum_data_d2;
+    assign psum_wen = psum_enable_d2;
 
 endmodule
