@@ -35,11 +35,11 @@ module pe_top (
     output wire [15:0] input_mem_addr,
     input  wire [127:0] input_mem_data,
     
-    // Partial Sum Buffer Interface (Read-Modify-Write)
-    output wire [9:0]  psum_raddr,         // Read address
-    input  wire [511:0] psum_rdata,        // Read data
-    output wire [9:0]  psum_waddr,         // Write address
-    output wire [511:0] psum_wdata,        // Write data (final results from PE array)
+    // Partial Sum Buffer Interface (Read-Modify-Write with True Dual Port BRAM)
+    // Note: psum_addr is used for both read and write (BRAM Port A addra)
+    output wire [9:0]  psum_addr,          // Address for read and write
+    input  wire [511:0] psum_rdata,        // Read data from BRAM
+    output wire [511:0] psum_wdata,        // Write data to BRAM
     output wire        psum_wen            // Write enable
 );
 
@@ -142,14 +142,10 @@ module pe_top (
     );
     
     // =========================================================================
+    // Partial Sum Accumulator
     // =========================================================================
-    // Partial Sum Output Logic
-    // =========================================================================
-    // Accumulation logic moved to psum_accumulator.
-    // Handles Read-Modify-Write with external BRAM.
-    
-    // Drive Read Address directly from Controller
-    assign psum_raddr = psum_acc_addr;
+    // Handles Read-Modify-Write with external True Dual Port BRAM.
+    // Address is shared for both read and write operations.
     
     psum_accumulator #(
         .ARRAY_DIM(16),
@@ -163,7 +159,7 @@ module pe_top (
         .addr_in(psum_acc_addr),
         .psum_in(pe_acc_out),
         .rdata(psum_rdata),
-        .waddr(psum_waddr),
+        .waddr(psum_addr),
         .wdata(psum_wdata),
         .wen(psum_wen)
     );

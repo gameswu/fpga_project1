@@ -80,7 +80,7 @@ module tb_pe_wrapper;
     // =========================================================================
     // Data Storage for Test Vectors
     // =========================================================================
-    reg signed [7:0] weights [0:KH-1][0:KW-1][0:CIN-1][0:COUT-1]·;
+    reg signed [7:0] weights [0:KH-1][0:KW-1][0:CIN-1][0:COUT-1];
     reg signed [7:0] inputs [0:IN_H-1][0:IN_W-1][0:CIN-1];
     reg signed [31:0] golden_output [0:OUT_H-1][0:OUT_W-1][0:COUT-1];
     
