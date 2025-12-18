@@ -8,7 +8,7 @@
  *   Wrapper port mapping:
  *   - addra_0, dina_0, wea_0: Weight Buffer write interface
  *   - addra_1, dina_1, wea_1: Activation Buffer write interface
- *   - addrb_0, doutb_0: Partial Sum Buffer read interface
+ *   - addr1_0, doutb_0, en1_0: Partial Sum Buffer read interface
  *
  * Author: Modified for BRAM-based design
  * Date: 2025-12-15
@@ -53,9 +53,10 @@ module tb_pe_wrapper;
     reg [127:0] dina_1;
     reg [0:0]   wea_1;
     
-    // Result Read Interface (addrb_0, doutb_0)
-    reg [9:0]   addrb_0;
+    // Result Read Interface (addr1_0, doutb_0)
+    reg [9:0]   addr1_0;
     wire [511:0] doutb_0;
+    reg         en1_0;
     
     // =========================================================================
     // DUT Instantiation - Vivado Generated Wrapper
@@ -73,7 +74,8 @@ module tb_pe_wrapper;
         .addra_1(addra_1),
         .dina_1(dina_1),
         .wea_1(wea_1),
-        .addrb_0(addrb_0),
+        .addr1_0(addr1_0),
+        .en1_0(en1_0),
         .doutb_0(doutb_0)
     );
     
@@ -124,7 +126,8 @@ module tb_pe_wrapper;
         addra_1 = 0;
         dina_1 = 0;
         wea_1 = 0;
-        addrb_0 = 0;
+        addr1_0 = 0;
+        en1_0 = 0;
         errors = 0;
         
         // Reset sequence
@@ -181,18 +184,20 @@ module tb_pe_wrapper;
         for (i=0; i<KH; i=i+1) begin
             for (j=0; j<KW; j=j+1) begin
                 for (l=0; l<COUT; l=l+1) begin
-                    // Pack all CIN weights (16 bytes) into one 128-bit word
+                    dina_0 = 128'h0;  // Clear first
+                    // Pack all CIN weights (up to 16 bytes) into one 128-bit word
                     for (k=0; k<CIN; k=k+1) begin
                         dina_0[k*8 +: 8] = weights[i][j][k][l];
                     end
-                    // Address: (ky*KW + kx)*16 + output_channel
-                    addra_0 = (i*KW + j)*16 + l;
+                    // Address: (ky*KW + kx)*COUT + cout
+                    addra_0 = (i*KW + j)*COUT + l;
                     wea_0 = 1;
                     #10;
                 end
             end
         end
         wea_0 = 0;
+        dina_0 = 128'h0;
         $display("[%t] Weight loading complete", $time);
         
         // =====================================================================
@@ -201,6 +206,7 @@ module tb_pe_wrapper;
         $display("[%t] Step 4: Loading activations...", $time);
         for (i=0; i<IN_H; i=i+1) begin
             for (j=0; j<IN_W; j=j+1) begin
+                dina_1 = 128'h0;  // Clear first
                 addra_1 = i*IN_W + j;
                 for (k=0; k<CIN; k=k+1) begin
                     dina_1[k*8 +: 8] = inputs[i][j][k];
@@ -210,6 +216,7 @@ module tb_pe_wrapper;
             end
         end
         wea_1 = 0;
+        dina_1 = 128'h0;
         $display("[%t] Activation loading complete", $time);
         
         // =====================================================================
@@ -340,10 +347,11 @@ module tb_pe_wrapper;
         begin
             checked = 0;
             nonzero_count = 0;
+            en1_0 = 1;
             for (oy=0; oy<OUT_H; oy=oy+1) begin
                 for (ox=0; ox<OUT_W; ox=ox+1) begin
-                    // Read from Psum Buffer via addrb_0
-                    addrb_0 = oy*OUT_W + ox;
+                    // Read from Psum Buffer via addr1_0
+                    addr1_0 = oy*OUT_W + ox;
                     #10; // Wait for read
                     #2;  // Extra delay for BRAM output
                     

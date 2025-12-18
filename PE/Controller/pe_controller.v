@@ -1,27 +1,18 @@
 /**
- * PE Controller - Processing Element Array Controller
+ * PE Controller - Streaming Refactor
  * 
  * Description:
- *   Orchestrates 16x16 PE Array for convolution operations.
- *   Implements Weight Stationary dataflow (Spatial Parallelism).
+ *   Orchestrates 16x16 PE Array for convolution with Weight Stationary dataflow.
+ *   Supports fully pipelined (streaming) execution for maximum throughput.
  *   
- *   Dataflow:
- *   1. Iterate over Output Tiles (Spatial).
- *   2. Iterate over Kernel (ky, kx) and Input Channels.
- *   3. Load Weight (Broadcast to all PEs).
- *   4. Load Input Tile (16x16 spatial patch).
- *   5. PEs accumulate: Acc += Input * Weight.
- *   6. Repeat for all ky, kx, Cin.
- *   7. Output final result.
- *
- *   Buffer Note:
- *   The "Buffer" for accumulating partial sums across the kernel/channel 
- *   dimensions is the internal Accumulator register within each MAC unit.
- *   This allows "same position needs to add" without external buffering
- *   until the full kernel window is processed.
- *
- * Author: shealligh
- * Date: 2025-12-08
+ *   Pipeline Depth: 4 Cycles
+ *   - T0: Address Generation (Input & Psum Read)
+ *   - T1-T2: BRAM Read Latency
+ *   - T3: Data Registration / Muxing
+ *   - T4: MAC Computation & Psum Write Back
+ * 
+ * Author: shealligh (Refactored by Copilot)
+ * Date: 2025-12-16
  */
 
 module pe_controller #(
@@ -36,270 +27,309 @@ module pe_controller #(
     input  wire        start,
     output reg         done,
     
-    // Configuration (Variable Sizes)
+    // Configuration
     input  wire [3:0]  kernel_h,
     input  wire [3:0]  kernel_w,
     input  wire [7:0]  input_h,
     input  wire [7:0]  input_w,
+    input  wire [7:0]  input_channels,
     input  wire [3:0]  stride,
     input  wire [3:0]  padding,
     input  wire [7:0]  output_h,
     input  wire [7:0]  output_w,
+    input  wire [7:0]  output_channels,
     
     // PE Array Interface
     output reg         weight_write_enable,
     output reg  [3:0]  weight_col,
     output reg  [ARRAY_DIM*8-1:0]  weight_data,
-    output reg  [ARRAY_DIM*8-1:0] pe_data_in, // Broadcast to rows
+    output reg  [ARRAY_DIM*8-1:0] pe_data_in,
+    output reg         pe_data_valid,
     
-    // Accumulator / Buffer Interface
-    output wire        acc_enable,
-    output wire        acc_clear,
-    output wire [9:0]  acc_addr,
-    input  wire [ARRAY_DIM*32-1:0] pe_acc_out, // From Array (Bottom)
+    // BRAM Direct Control (psum buffer)
+    // Split into Read and Write ports for Dual Port operation
+    output wire [9:0]  psum_raddr,
+    output wire [9:0]  psum_waddr,
+    output wire        psum_wen,
+    output wire        psum_clear, // Aligned to Read Data (T3)
     
-    // External Memory Interface (Simplified)
+    output wire [ARRAY_DIM*32-1:0] pe_acc_out_buf_o, // Not used in streaming mode (direct connect)
+    input  wire [ARRAY_DIM*32-1:0] pe_acc_out,       // From PE Array
+    input  wire        pe_acc_out_valid,             // From PE Array
+    
+    // External Memory Interface
     output reg  [15:0] weight_mem_addr,
     input  wire [ARRAY_DIM*8-1:0] weight_mem_data,
     
-    output reg  [15:0] input_mem_addr,
-    input  wire [ARRAY_DIM*8-1:0] input_mem_data // Vector of 16 bytes
+    output wire [15:0] input_mem_addr, // Changed to wire for combinational output
+    input  wire [ARRAY_DIM*8-1:0] input_mem_data
 );
 
-    // State Machine
-    localparam S_IDLE = 0;
-    localparam S_LOAD_WEIGHT_INIT = 1;
-    localparam S_LOAD_WEIGHT_LOOP = 2;
-    localparam S_STREAM_INIT = 3;
-    localparam S_STREAM_RUN = 4;
-    localparam S_NEXT_KERNEL = 5;
-    localparam S_DONE = 6;
-    localparam S_LOAD_WEIGHT_WAIT = 7;
+    // =========================================================================
+    // 1. State Definitions
+    // =========================================================================
+    localparam S_IDLE           = 0;
+    localparam S_CALC_BATCHES   = 1;
+    localparam S_LOAD_WEIGHTS   = 2;
+    localparam S_WAIT_WEIGHTS   = 3;
+    localparam S_STREAM_RUN     = 4; // Continuous streaming state
+    localparam S_DRAIN_PIPE     = 5; // Wait for pipeline to empty
+    localparam S_UPDATE_LOOPS   = 6;
+    localparam S_DONE           = 7;
     
-    reg [2:0] state;
+    reg [3:0] state;
     
-    // Output Dimensions (defined by input_h/w in this controller version)
-    // Ideally, input_h/w should be output_h/w, and we read from (oy+ky, ox+kx)
-    // Let's assume the configured input_h/w are actually the OUTPUT dimensions we want to iterate over.
-    
-    // Loop Counters
+    // =========================================================================
+    // 2. Loop Counters
+    // =========================================================================
+    // Outer Loops (Stationary during stream)
     reg [3:0] ky, kx;
-    reg [7:0] oy, ox; // Output Y, Output X
+    reg [7:0] oc, ic;
     
-    // Weight Loading Counters
+    // Inner Loops (Streaming)
+    reg [7:0] oy, ox;
+    
+    // Weight Loading
     reg [3:0] wc;
     
-    // Pipeline Delay Logic
-    // Array Latency = 16 cycles (1 reg per row)
-    // Memory Read Latency = 1 cycle (Addr->Mem->Reg)
-    // Total Latency = 17 cycles.
-    // We need index 18 (depth 19) to align T+1 to T+19.
-    reg acc_enable_pipe [0:18];  // 19-stage shift register
-    reg acc_clear_pipe [0:18];   // 19-stage shift register
-    reg [9:0]  acc_addr_pipe [0:18];
-    reg [4:0]  drain_cnt;
-    reg zero_input;
-    reg zero_input_d1;
+    // Batch Info
+    reg [7:0] num_ic_batches;
+    reg [7:0] num_oc_batches;
+    reg [7:0] oc_batch_size;
     
-    // Weight Loading Pipeline
-    reg [3:0] wc_d1, wc_d2;
-    reg we_d1, we_d2;
-    reg [1:0] load_wait_cnt;
+    // Loop Boundary Flags
+    wire ox_last = (ox == output_w - 1);
+    wire oy_last = (oy == output_h - 1);
+    wire ic_last = (ic + 16 >= input_channels);
+    wire oc_last = (oc + 16 >= output_channels);
+    wire kx_last = (kx == kernel_w - 1);
+    wire ky_last = (ky == kernel_h - 1);
+    wire wc_last = (wc == oc_batch_size - 1);
     
-    // Coordinate calculation temporary variables
-    reg signed [15:0] iy_s;
-    reg signed [15:0] ix_s;
+    // =========================================================================
+    // 3. Address Generation (Combinational - T0)
+    // =========================================================================
     
-    // Next-cycle values for pipeline input (set by state machine)
-    reg acc_enable_next;
-    reg acc_clear_next;
-    reg [9:0] acc_addr_next;
-
-    integer p;
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            for (p=0; p<19; p=p+1) begin
-                acc_enable_pipe[p] <= 0;
-                acc_clear_pipe[p] <= 0;
-                acc_addr_pipe[p] <= 0;
-            end
-            
-            we_d1 <= 0; we_d2 <= 0;
-            wc_d1 <= 0; wc_d2 <= 0;
-            zero_input <= 0;
-            zero_input_d1 <= 0;
+    // Use effective stride to prevent stuck-at-0 issues if config is missing
+    wire [3:0] stride_eff = (stride == 0) ? 4'd1 : stride;
+    
+    // --- Input Address ---
+    // Use explicit signed extension for calculation
+    wire signed [15:0] iy_calc = $signed({8'b0, oy}) * $signed({12'b0, stride_eff}) + $signed({12'b0, ky}) - $signed({12'b0, padding});
+    wire signed [15:0] ix_calc = $signed({8'b0, ox}) * $signed({12'b0, stride_eff}) + $signed({12'b0, kx}) - $signed({12'b0, padding});
+    
+    // Check bounds (must be non-negative and within dimensions)
+    wire input_valid_coord = (!iy_calc[15] && iy_calc < {8'b0, input_h} && 
+                              !ix_calc[15] && ix_calc < {8'b0, input_w});
+    
+    // Calculate address only if valid to avoid overflow/underflow weirdness
+    // Use 32-bit arithmetic for intermediate steps
+    reg [31:0] input_addr_calc;
+    always @(*) begin
+        if (input_valid_coord) begin
+            input_addr_calc = (iy_calc[15:0] * {24'b0, input_w} + ix_calc[15:0]) * {24'b0, num_ic_batches} + {24'b0, (ic >> 4)};
         end else begin
-            zero_input_d1 <= zero_input;
-            
-            // Shift Register for Accumulator
-            // Update pipe[0] from next-cycle signals set by state machine
-            acc_enable_pipe[0] <= acc_enable_next;
-            acc_clear_pipe[0] <= acc_clear_next;
-            acc_addr_pipe[0] <= acc_addr_next;
-            
-            // Shift remaining stages
-            for (p=18; p>0; p=p-1) begin
-                acc_enable_pipe[p] <= acc_enable_pipe[p-1];
-                acc_clear_pipe[p] <= acc_clear_pipe[p-1];
-                acc_addr_pipe[p] <= acc_addr_pipe[p-1];
-            end
-            
-            // Pipeline for Weight Loading
-            // Input to d1 comes from current state (wr, wc)
-            // Only valid during LOAD_WEIGHT_LOOP
-            we_d1 <= (state == S_LOAD_WEIGHT_LOOP);
-            wc_d1 <= wc;
-            
-            we_d2 <= we_d1;
-            wc_d2 <= wc_d1;
+            input_addr_calc = 0;
         end
     end
     
-    // Output the delayed signals
-    assign acc_enable = acc_enable_pipe[18]; // Delayed by 18 cycles relative to pipe[0] (Total 19 from start)
-    assign acc_clear = acc_clear_pipe[18];
-    assign acc_addr = acc_addr_pipe[18];
+    wire [15:0] input_addr_next = input_addr_calc[15:0];
     
-    // Drive Weight Outputs from Pipeline
+    // Combinational assignment for input_mem_addr to save 1 cycle latency
+    // T0: Addr Valid -> BRAM Sample at T0 Edge -> Data Valid T2 Edge -> Sample T3 Edge
+    assign input_mem_addr = input_addr_next;
+
+    // --- Weight Address ---
+    wire [15:0] weight_addr_next = ((ky * kernel_w + kx) * output_channels + (oc + wc)) * num_ic_batches + (ic >> 4);
+    
+    // --- Psum Address (Read) ---
+    wire [9:0] psum_raddr_next = (oy * output_w + ox) * num_oc_batches + (oc >> 4);
+    
+    // =========================================================================
+    // 4. Pipeline Control (Shift Registers)
+    // =========================================================================
+    
+    localparam BRAM_LATENCY = 2; 
+    localparam PIPE_DEPTH = 21; 
+    
+    reg [PIPE_DEPTH-1:0] pipe_valid;
+    reg [PIPE_DEPTH-1:0] pipe_clear;
+    reg [9:0]            pipe_addr [0:PIPE_DEPTH-1];
+    
+    integer i;
+    
+    // Pipeline Shift Logic
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
+            pipe_valid <= 0;
+            pipe_clear <= 0;
+            for(i=0; i<PIPE_DEPTH; i=i+1) pipe_addr[i] <= 0;
+        end else begin
+            if (state == S_STREAM_RUN) begin
+                pipe_valid <= {pipe_valid[PIPE_DEPTH-2:0], 1'b1};
+                pipe_clear <= {pipe_clear[PIPE_DEPTH-2:0], (ky == 0 && kx == 0 && ic == 0)};
+                for(i=PIPE_DEPTH-1; i>0; i=i-1) pipe_addr[i] <= pipe_addr[i-1];
+                pipe_addr[0] <= psum_raddr_next;
+            end else if (state == S_DRAIN_PIPE) begin
+                pipe_valid <= {pipe_valid[PIPE_DEPTH-2:0], 1'b0};
+                pipe_clear <= {pipe_clear[PIPE_DEPTH-2:0], 1'b0};
+                for(i=PIPE_DEPTH-1; i>0; i=i-1) pipe_addr[i] <= pipe_addr[i-1];
+                pipe_addr[0] <= 0;
+            end else begin
+                pipe_valid <= 0;
+                pipe_clear <= 0;
+            end
+        end
+    end
+    
+    // --- Output Assignments (Fixed) ---
+    
+    // Read Address: T18 (Correct timing for Latency=2 BRAM)
+    // pipe_addr[0] is T1. pipe_addr[17] is T18.
+    // T18 Read -> T20 Data Valid -> Matches PE Output at T20.
+    assign psum_raddr = pipe_addr[17]; 
+    
+    // Write Address: T20 (Unchanged)
+    assign psum_waddr = pipe_addr[19];
+    
+    // Write Enable: T20
+    assign psum_wen = pipe_valid[19];
+    
+    // Clear Signal: T20
+    assign psum_clear = pipe_clear[19]; 
+    
+    assign pe_acc_out_buf_o = pe_acc_out; 
+    
+    
+    // --- Input Data Pipeline (T0 -> T4) ---
+    
+    reg [3:0] input_valid_pipe; 
+    
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pe_data_in <= 0;
+            pe_data_valid <= 0;
+            input_valid_pipe <= 0;
+        end else begin
+            // Shift input validity
+            if (state == S_STREAM_RUN)
+                input_valid_pipe <= {input_valid_pipe[2:0], input_valid_coord};
+            else if (state == S_DRAIN_PIPE)
+                input_valid_pipe <= {input_valid_pipe[2:0], 1'b0};
+            else
+                input_valid_pipe <= 0;
+                
+            // T3: Register Data
+            // 【关键修复】使用 [2] 而不是 [1]
+            // T0(Valid) -> T1(p0) -> T2(p1) -> T3(p2)
+            // 在 T3 时钟沿，p[2] 保存的是 T0 时刻的有效性。
+            // 之前使用 p[1] 导致最后一个像素（T0有效，T1无效）被误杀为 0。
+            if (input_valid_pipe[2]) begin
+                pe_data_in <= input_mem_data;
+                pe_data_valid <= 1'b1; 
+            end else begin
+                pe_data_in <= 0; // Zero padding
+                pe_data_valid <= 1'b1; 
+            end
+        end
+    end
+
+    // =========================================================================
+    // 5. Weight Loading Pipeline (Unchanged)
+    // =========================================================================
+    reg [2:0] we_pipe;
+    reg [3:0] wc_pipe [0:2];
+    
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            we_pipe <= 0;
             weight_write_enable <= 0;
             weight_col <= 0;
             weight_data <= 0;
+            for(i=0; i<3; i=i+1) wc_pipe[i] <= 0;
         end else begin
-            weight_write_enable <= we_d2;
-            weight_col <= wc_d2;
-            weight_data <= weight_mem_data; // Captures full column
+            we_pipe <= {we_pipe[1:0], (state == S_LOAD_WEIGHTS)};
+            
+            wc_pipe[2] <= wc_pipe[1];
+            wc_pipe[1] <= wc_pipe[0];
+            wc_pipe[0] <= wc;
+            
+            weight_write_enable <= we_pipe[2];
+            weight_col <= wc_pipe[2];
+            weight_data <= weight_mem_data;
         end
     end
-    
-    // Continuous Data Capture
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) pe_data_in <= 0;
-        else if (zero_input_d1) pe_data_in <= 0;
-        else pe_data_in <= input_mem_data;
-    end
 
+    // =========================================================================
+    // 6. Main FSM
+    // =========================================================================
+    
+    reg [4:0] drain_cnt;
+    
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= S_IDLE;
             done <= 0;
             ky <= 0; kx <= 0;
             oy <= 0; ox <= 0;
+            oc <= 0; ic <= 0;
             wc <= 0;
-            drain_cnt <= 0;
-            load_wait_cnt <= 0;
+            // input_mem_addr is wire now
             weight_mem_addr <= 0;
-            input_mem_addr <= 0;
+            num_ic_batches <= 0;
+            num_oc_batches <= 0;
+            oc_batch_size <= 0;
+            drain_cnt <= 0;
         end else begin
-            // Defaults
-            // weight_write_enable <= 0; // Removed, driven by separate block
-            // done <= 0; // Removed to allow sticky done
-            
-            // Default pipe input (0 unless overridden)
-            acc_enable_next = 0;
-            acc_clear_next = 0;
-            acc_addr_next = 0;
-            
-            // Default zero_input (cleared unless set)
-            // Wait, zero_input is a register, it holds value.
-            // But we want it to be controlled by state machine for the NEXT cycle.
-            // So we should set it in the state machine.
-            // But here we are inside the always block.
-            // Let's set default to 0.
-            zero_input <= 0;
-            
             case (state)
                 S_IDLE: begin
                     if (start) begin
-                        state <= S_LOAD_WEIGHT_INIT;
+                        state <= S_CALC_BATCHES;
+                        done <= 0;
                         ky <= 0; kx <= 0;
-                        done <= 0; // Clear done on start
+                        oy <= 0; ox <= 0;
+                        oc <= 0; ic <= 0;
                     end
                 end
                 
-                // -------------------------------------------------------------
-                // 1. Load Weights for current (ky, kx) slice
-                // -------------------------------------------------------------
-                S_LOAD_WEIGHT_INIT: begin
+                S_CALC_BATCHES: begin
+                    num_ic_batches <= (input_channels == 0) ? 1 : ((input_channels + 15) >> 4);
+                    num_oc_batches <= (output_channels == 0) ? 1 : ((output_channels + 15) >> 4);
+                    state <= S_LOAD_WEIGHTS;
                     wc <= 0;
-                    state <= S_LOAD_WEIGHT_LOOP;
+                    
+                    // Calculate current batch size
+                    if (oc + 16 <= output_channels) oc_batch_size <= 16;
+                    else oc_batch_size <= output_channels - oc;
                 end
                 
-                S_LOAD_WEIGHT_LOOP: begin
-                    // Fetch weight from memory (Column-wise)
-                    weight_mem_addr <= (ky * kernel_w + kx) * 16 + wc;
-                    
-                    // Outputs are driven by pipeline registers
-                    
-                    if (wc == 15) begin
+                S_LOAD_WEIGHTS: begin
+                    weight_mem_addr <= weight_addr_next;
+                    if (wc_last) begin
                         wc <= 0;
-                        state <= S_LOAD_WEIGHT_WAIT; // Wait for pipeline to drain
-                        load_wait_cnt <= 0;
+                        state <= S_WAIT_WEIGHTS; 
                     end else begin
                         wc <= wc + 1;
                     end
                 end
                 
-                S_LOAD_WEIGHT_WAIT: begin
-                    // Wait 2 cycles for pipeline to finish writing weights
-                    if (load_wait_cnt == 2) begin
-                        state <= S_STREAM_INIT;
-                    end else begin
-                        load_wait_cnt <= load_wait_cnt + 1;
-                    end
-                end
-                
-                // -------------------------------------------------------------
-                // 2. Stream Input Image (Iterate over Output Pixels)
-                // -------------------------------------------------------------
-                S_STREAM_INIT: begin
-                    oy <= 0; ox <= 0;
-                    state <= S_STREAM_RUN;
+                S_WAIT_WEIGHTS: begin
+                    if (we_pipe == 0) state <= S_STREAM_RUN;
                 end
                 
                 S_STREAM_RUN: begin
-                    // Drive Inputs
-                    // Convolution: Read Input at (oy*stride + ky - padding, ox*stride + kx - padding)
+                    // Continuous Streaming
+                    // 1. Issue Addresses (Combinational logic drives outputs)
+                    // input_mem_addr is now combinational, so no assignment here
                     
-                    // Calculate signed coordinates
-                    // We use 16-bit signed arithmetic
-                    // iy = oy * stride + ky - padding
-                    // ix = ox * stride + kx - padding
-                    
-                    iy_s = $signed({8'b0, oy}) * $signed({12'b0, stride}) + $signed({12'b0, ky}) - $signed({12'b0, padding});
-                    ix_s = $signed({8'b0, ox}) * $signed({12'b0, stride}) + $signed({12'b0, kx}) - $signed({12'b0, padding});
-                    
-                    if (iy_s >= 0 && iy_s < $signed({8'b0, input_h}) && ix_s >= 0 && ix_s < $signed({8'b0, input_w})) begin
-                        input_mem_addr <= iy_s * input_w + ix_s;
-                        zero_input <= 0;
-                    end else begin
-                        input_mem_addr <= 0;
-                        zero_input <= 1;
-                    end
-                    
-                    // Debug
-                    // $display("Time %t: oy=%d ox=%d ky=%d kx=%d -> iy=%d ix=%d (Valid: %b) Addr=%d Zero=%b", 
-                    //     $time, oy, ox, ky, kx, iy_s, ix_s, 
-                    //     (iy_s >= 0 && iy_s < $signed({8'b0, input_h}) && ix_s >= 0 && ix_s < $signed({8'b0, input_w})),
-                    //     (iy_s * input_w + ix_s), zero_input);
-                    
-                    // Accumulator Control
-                    // We accumulate into (oy, ox)
-                    acc_enable_next = 1;
-                    acc_addr_next = oy * output_w + ox; // Use output_w for stride
-                    
-                    if (ky == 0 && kx == 0) 
-                        acc_clear_next = 1;
-                    else 
-                        acc_clear_next = 0;
-                        
-                    // Loop Spatial
-                    // Iterate over Output Dimensions
-                    if (ox == output_w - 1) begin
+                    // 2. Loop Counters
+                    if (ox_last) begin
                         ox <= 0;
-                        if (oy == output_h - 1) begin
-                            state <= S_NEXT_KERNEL;
+                        if (oy_last) begin
+                            oy <= 0;
+                            // Finished the whole image plane for this weight
+                            state <= S_DRAIN_PIPE;
+                            drain_cnt <= 0;
                         end else begin
                             oy <= oy + 1;
                         end
@@ -308,43 +338,48 @@ module pe_controller #(
                     end
                 end
                 
-                // -------------------------------------------------------------
-                // 3. Next Kernel Slice
-                // -------------------------------------------------------------
-                S_NEXT_KERNEL: begin
-                    acc_enable_next = 0; // Ensure disabled
-                    
-                    // Wait for pipeline to drain?
-                    // The controller moves to LOAD_WEIGHT immediately.
-                    // But the array is still processing the last 16 inputs.
-                    // We need to wait 16 cycles before starting the next kernel load?
-                    // Actually, loading weights doesn't affect the pipeline flow IF we don't overwrite weights being used.
-                    // But we ARE overwriting weights.
-                    // So we MUST wait for the pipeline to drain (16 cycles).
-                    
-                    if (drain_cnt == 20) begin
-                        drain_cnt <= 0;
-                        if (kx == kernel_w - 1) begin
-                            kx <= 0;
-                            if (ky == kernel_h - 1) begin
-                                state <= S_DONE;
-                            end else begin
-                                ky <= ky + 1;
-                                state <= S_LOAD_WEIGHT_INIT;
-                            end
-                        end else begin
-                            kx <= kx + 1;
-                            state <= S_LOAD_WEIGHT_INIT;
-                        end
+                S_DRAIN_PIPE: begin
+                    // Wait for pipeline to empty (PIPE_DEPTH cycles)
+                    if (drain_cnt == PIPE_DEPTH + 1) begin
+                        state <= S_UPDATE_LOOPS;
                     end else begin
                         drain_cnt <= drain_cnt + 1;
                     end
                 end
                 
+                S_UPDATE_LOOPS: begin
+                    // Update Outer Loops
+                    if (!ic_last) begin
+                        ic <= ic + 16;
+                        state <= S_CALC_BATCHES;
+                    end else begin
+                        ic <= 0;
+                        if (!oc_last) begin
+                            oc <= oc + 16;
+                            state <= S_CALC_BATCHES;
+                        end else begin
+                            oc <= 0;
+                            if (!kx_last) begin
+                                kx <= kx + 1;
+                                state <= S_CALC_BATCHES;
+                            end else begin
+                                kx <= 0;
+                                if (!ky_last) begin
+                                    ky <= ky + 1;
+                                    state <= S_CALC_BATCHES;
+                                end else begin
+                                    state <= S_DONE;
+                                end
+                            end
+                        end
+                    end
+                end
+                
                 S_DONE: begin
                     done <= 1;
-                    state <= S_IDLE;
+                    if (!start) state <= S_IDLE;
                 end
+                
             endcase
         end
     end

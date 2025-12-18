@@ -18,6 +18,15 @@
  *   0x0C: Input Dimensions
  *         Bits 7:0   -> Input Width (W)
  *         Bits 15:8  -> Input Height (H)
+ *   0x10: Stride & Padding
+ *         Bits 3:0   -> Stride
+ *         Bits 7:4   -> Padding
+ *   0x14: Output Dimensions
+ *         Bits 7:0   -> Output Width
+ *         Bits 15:8  -> Output Height
+ *   0x18: Channel Configuration
+ *         Bits 7:0   -> Input Channels (must be 16 or multiple of 16)
+ *         Bits 15:8  -> Output Channels (Total, auto-batched in groups of 16)
  *
  * Author: shealligh
  * Date: 2025-12-11
@@ -44,7 +53,9 @@ module config_regs (
     output reg  [3:0]  stride,
     output reg  [3:0]  padding,
     output reg  [7:0]  output_h,
-    output reg  [7:0]  output_w
+    output reg  [7:0]  output_w,
+    output reg  [7:0]  input_channels,   // Total input channels
+    output reg  [7:0]  output_channels  // Total output channels
 );
 
     // Internal storage
@@ -54,6 +65,7 @@ module config_regs (
     reg [31:0] input_dim_reg;
     reg [31:0] param_reg;
     reg [31:0] output_dim_reg;
+    reg [31:0] channel_reg;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -62,6 +74,7 @@ module config_regs (
             input_dim_reg  <= 0;
             param_reg      <= 0;
             output_dim_reg <= 0;
+            channel_reg    <= 0;
             
             start    <= 0;
             kernel_h <= 0;
@@ -72,6 +85,8 @@ module config_regs (
             padding  <= 0;
             output_h <= 0;
             output_w <= 0;
+            input_channels <= 16;   // Default 16
+            output_channels <= 16;  // Default 16
         end else begin
             // Auto-clear start after 1 cycle (Pulse)
             if (start) start <= 0;
@@ -102,6 +117,11 @@ module config_regs (
                         output_w <= reg_wdata[7:0];
                         output_h <= reg_wdata[15:8];
                     end
+                    4'h6: begin // Channel Config (Addr 0x18 -> Index 6)
+                        channel_reg <= reg_wdata;
+                        input_channels <= reg_wdata[7:0];
+                        output_channels <= reg_wdata[15:8];
+                    end
                 endcase
             end
         end
@@ -116,6 +136,8 @@ module config_regs (
             4'h2: reg_rdata_comb = kernel_dim_reg;
             4'h3: reg_rdata_comb = input_dim_reg;
             4'h4: reg_rdata_comb = param_reg;
+            4'h5: reg_rdata_comb = output_dim_reg;
+            4'h6: reg_rdata_comb = channel_reg;
             default: reg_rdata_comb = 32'd0;
         endcase
     end

@@ -41,9 +41,11 @@ module pe_array #(
     // ...
     // data_in[15] -> Row 15 (Input Channel 15)
     input wire [ARRAY_DIM*DATA_WIDTH-1:0] data_in,
+    input wire data_valid,  // Input valid signal
     
     // Partial Sum Outputs (From Bottom Row)
-    output wire [ARRAY_DIM*ACC_WIDTH-1:0] psum_out
+    output wire [ARRAY_DIM*ACC_WIDTH-1:0] psum_out,
+    output wire psum_out_valid  // Output valid signal
 );
 
     // =========================================================================
@@ -53,6 +55,9 @@ module pe_array #(
     // row_data_in[r] is the skewed input for Row r
     wire signed [DATA_WIDTH-1:0] row_data_in [0:ARRAY_DIM-1];
     
+    // Valid signal skewing (same pattern as data)
+    wire row_valid [0:ARRAY_DIM-1];
+    
     // Generate delay registers
     genvar i;
     generate
@@ -60,23 +65,31 @@ module pe_array #(
             if (i == 0) begin
                 // Row 0: No delay
                 assign row_data_in[i] = data_in[DATA_WIDTH-1:0];
+                assign row_valid[i] = data_valid;
             end else begin
                 // Row i: i cycles delay
                 reg [DATA_WIDTH-1:0] dly_regs [0:i-1];
+                reg dly_valid [0:i-1];
                 integer k;
                 
                 always @(posedge clk or negedge rst_n) begin
                     if (!rst_n) begin
-                        for (k = 0; k < i; k = k + 1) dly_regs[k] <= 0;
+                        for (k = 0; k < i; k = k + 1) begin
+                            dly_regs[k] <= 0;
+                            dly_valid[k] <= 0;
+                        end
                     end else begin
                         dly_regs[0] <= data_in[i*DATA_WIDTH +: DATA_WIDTH];
+                        dly_valid[0] <= data_valid;
                         for (k = 1; k < i; k = k + 1) begin
                             dly_regs[k] <= dly_regs[k-1];
+                            dly_valid[k] <= dly_valid[k-1];
                         end
                     end
                 end
                 
                 assign row_data_in[i] = dly_regs[i-1];
+                assign row_valid[i] = dly_valid[i-1];
             end
         end
     endgenerate
@@ -113,13 +126,9 @@ module pe_array #(
                     .clk(clk),
                     .rst_n(rst_n),
                     .weight_load(pe_load),
-                    // Input Data (Skewed)
                     .data_in(row_data_in[r]),
-                    // Weight Data (From common input vector, sliced for this row)
                     .weight_in(weight_in[r*DATA_WIDTH +: DATA_WIDTH]),
-                    // Partial Sum Input (From PE above)
                     .psum_in(psum_inter[r][c]),
-                    // Partial Sum Output (To PE below)
                     .psum_out(psum_inter[r+1][c])
                 );
             end
@@ -132,5 +141,24 @@ module pe_array #(
             assign psum_out[c*ACC_WIDTH +: ACC_WIDTH] = psum_inter[ARRAY_DIM][c];
         end
     endgenerate
+    
+    // =========================================================================
+    // Output Valid Signal Generation
+    // =========================================================================
+    // Valid signal propagates through input skewing, then through MAC
+    // Row 15 has max skew (15 cycles) + MAC pipeline (1 cycle)
+    // So we need to delay row_valid[15] by 1 more cycle for MAC output
+    
+    reg psum_out_valid_reg;
+    
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            psum_out_valid_reg <= 0;
+        end else begin
+            psum_out_valid_reg <= row_valid[ARRAY_DIM-1];  // Delay for MAC pipeline
+        end
+    end
+    
+    assign psum_out_valid = psum_out_valid_reg;
 
 endmodule

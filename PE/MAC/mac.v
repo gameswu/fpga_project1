@@ -1,21 +1,9 @@
 /**
- * MAC Unit (Multiply-Accumulate Unit) - Weight Stationary Version
+ * MAC Unit (Multiply-Accumulate Unit) - Behavioral Model for Debug
  * 
  * Description:
- *   Core computational unit for INT8 inference.
- *   Supports Weight Stationary dataflow with external Partial Sum accumulation.
- *   
- *   Operation:
- *   Psum_out = Psum_in + (Data_in * Weight_reg)
- *   
- * Features:
- *   - INT8 signed multiplication
- *   - INT32 accumulation
- *   - Weight stationary design (weight register for reuse)
- *   - External Partial Sum chaining/buffering support
- *
- * Author: gameswu
- * Date: 2025-11-24
+ *   Pure Verilog implementation of Psum_out = Psum_in + (Data_in * Weight_reg)
+ *   Used to verify logic correctness without DSP IP complexity.
  */
 
 module mac (
@@ -32,55 +20,65 @@ module mac (
     input  wire signed [31:0] psum_in,      // Partial Sum Input (from Buffer)
     
     // Data Output
-    output reg  signed [31:0] psum_out      // Partial Sum Output (to Buffer)
+    output wire signed [31:0] psum_out      // Partial Sum Output (Registered)
 );
 
     // =========================================================================
-    // Internal Registers
+    // Behavioral Implementation (Replaces DSP IP)
     // =========================================================================
     
-    // Weight register (stationary weight for reuse)
+    // 1. Weight Register (Simulates DSP B-Register)
     reg signed [7:0] weight_reg;
-    
-    // Multiplication result
-    wire signed [15:0] mult_result;
-    
-    
-    // =========================================================================
-    // Combinational Logic
-    // =========================================================================
-    
-    // Signed multiplication: INT8 × INT8 = INT16
-    assign mult_result = data_in * weight_reg;
-    
-    
-    // =========================================================================
-    // Sequential Logic - Weight Register
-    // =========================================================================
-    
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            weight_reg <= 8'sd0;
-        end
-        else if (weight_load) begin
+            weight_reg <= 8'd0;
+        end else if (weight_load) begin
             weight_reg <= weight_in;
         end
     end
-    
-    
-    // =========================================================================
-    // Sequential Logic - Computation Pipeline
-    // =========================================================================
-    
+
+    // 2. Multiply-Accumulate Logic with Output Register (Simulates DSP P-Register)
+    // Latency: 1 cycle (Input -> Output)
+    // Logic: P_next = (A * B_reg) + C
+    reg signed [31:0] psum_out_reg;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            psum_out <= 32'sd0;
-        end
-        else begin
-            // Calculate and register output
-            // Psum_out = Psum_in + (Input * Weight)
-            psum_out <= psum_in + {{16{mult_result[15]}}, mult_result};
+            psum_out_reg <= 32'd0;
+        end else begin
+            // Verilog handles sign extension automatically for 'signed' types
+            psum_out_reg <= (data_in * weight_reg) + psum_in;
         end
     end
+
+    assign psum_out = psum_out_reg;
     
+    // =========================================================================
+    // DSP IP Instantiation (Commented Out)
+    // =========================================================================
+
+    /*
+    mac_dsp_wrapper u_mac_dsp (
+        .CLK_0(clk),
+        
+        // Data Path (Direct connection, no register)
+        .A_0(data_in),
+        
+        // Weight Path (Registered, controlled by weight_load)
+        .CEB3_0(weight_load),
+        .B_0(weight_in),
+        
+        // Psum Path (Direct connection, no register)
+        .C_0(psum_in),
+        
+        // Output Path (Registered, always enabled)
+        .CEP_0(1'b1),
+        .P_0(psum_out), // Connect to 32-bit output
+        
+        // Reset (Synchronous Clear for P register)
+        .SCLRP_0(~rst_n) 
+    );
+    */
+
 endmodule
