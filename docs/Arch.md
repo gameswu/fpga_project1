@@ -9,7 +9,8 @@
 *   **数据流**: 脉动式 (Systolic) —— 特征图水平流动，部分和垂直累加。
 *   **精度**: INT8 输入/权重，INT32 累加。
 *   **控制策略**: 基于 Controller 的全局调度，支持 Tiling (分块) 以处理任意规模的网络层。
-*   **硬件平台**: Xilinx FPGA (Vivado Design Suite)。
+*   **硬件平台**: Xilinx Zynq-7000 SoC (xc7z020) - PS (ARM Cortex-A9) + PL (FPGA)。
+*   **通信接口**: 5× AXI GPIO (32-bit) 实现 PS-PL 数据交换，UART 实现 PC-ARM 通信。
 
 ---
 
@@ -77,6 +78,51 @@ Controller 是整个加速器的大脑，负责协调数据流动和计算调度
         *   **Port A**: 512-bit Write (Dedicated to Accelerator).
         *   **Port B**: 512-bit Read (Shared by Accelerator Accumulation and Host Read).
 
+### 2.8 Zynq PS-PL 接口 (On-Board Deployment)
+*   **平台**: Zynq-7000 SoC (xc7z020) - ARM Cortex-A9 (PS) + FPGA (PL)
+*   **通信架构**: PC ↔ UART (115200 baud) ↔ ARM ↔ AXI GPIO ↔ FPGA Accelerator
+*   **AXI GPIO 映射** (地址空间 0x41200000-0x41240000):
+    *   **GPIO_CMD_ADDR** (0x41200000): 命令地址总线 - CSR寄存器地址、BRAM地址选择
+    *   **GPIO_CMD_WDATA** (0x41210000): 命令写数据总线 - 向CSR/BRAM写入32-bit数据
+    *   **GPIO_CMD_RDATA** (0x41220000): 命令读数据总线 - 从CSR/BRAM读取32-bit数据
+    *   **GPIO_CONTROL** (0x41230000): 控制信号 - 读写使能、操作触发
+    *   **GPIO_INTR** (0x41240000): 中断信号 - 计算完成通知
+
+*   **访问协议**:
+    1. 写操作: 设置 CMD_ADDR → 设置 CMD_WDATA → 触发 CONTROL 写使能
+    2. 读操作: 设置 CMD_ADDR → 触发 CONTROL 读使能 → 从 CMD_RDATA 读取结果
+    3. CSR 配置: 通过 CMD_ADDR 选择寄存器偏移，CMD_WDATA 写入配置值
+    4. BRAM 访问: 通过 CMD_ADDR 指定BRAM地址，CMD_WDATA/RDATA 进行数据传输
+
+#### 数据格式要求 (Critical)
+由于 BRAM 的宽数据路径设计 (256-bit IFM read, 128-bit Weight read)，Host 写入时必须遵循特定的数据布局：
+
+**Weight 数据格式 (Tile Organization)**:
+*   硬件期望: 每个卷积核空间位置 $(k_h, k_w)$ 对应一个 **512 字节块** (32 IC rows × 16 OC columns)
+*   Tile 分块: OC 按 16 划分 (tile0: OC[0-15], tile1: OC[16-31], ...)
+*   Zero Padding: IC < 32 时需补零到 32 行以填满 PE 阵列
+*   示例 (Layer1: IC=1, OC=32, Kernel=5×5):
+    *   原始大小: 32×1×5×5 = 800 bytes (INT8)
+    *   传输大小: 50 kernel points × 512 bytes = **25,600 bytes**
+    *   布局: `[tile0_k00, tile1_k00, tile0_k01, tile1_k01, ..., tile0_k44, tile1_k44]`
+    *   每个 512-byte 块包含 32×16 矩阵，其中 IC=1 时只有第一行有真实数据，其余 31 行为 0
+
+**IFM 数据格式 (Pixel Expansion)**:
+*   硬件期望: Controller 以 256-bit (32 bytes) 为单位读取，对应 32 个并行 IC
+*   每个像素占用: **8 个连续的 32-bit words = 32 bytes**
+*   数据位置: 仅第一个 word 的 LSB (字节0) 包含像素值，其余 31 字节为 0 (IC padding)
+*   示例 (Layer1: 32×32×1 输入图像):
+    *   原始大小: 1024 pixels × 1 byte = 1,024 bytes (INT8)
+    *   传输大小: 1024 pixels × 32 bytes/pixel = **32,768 bytes**
+    *   布局: `[pixel0_word0~7, pixel1_word0~7, ..., pixel1023_word0~7]`
+    *   每个 pixel 的 word0[7:0] = 像素值，word0[31:8] 和 word1~7 全为 0
+
+**OFM 数据格式 (Tile-Interleaved)**:
+*   硬件输出: Controller 以 tile-interleaved 格式写入 (地址 = $(y×W+x)×num\_tiles + tile$)
+*   Host 读取: 通过 32-bit mux 从 512-bit BRAM 读取，地址 $N$ 映射到 512-bit word $N/16$
+*   De-Interleave 需求: 验证时需将 tile 格式转换为标准 HWC 格式
+*   地址偏移: 实测发现输出有 32 元素偏移 (第一个有效数据在地址 32 而非 0)，验证时需跳过前 32 个 int32
+
 ---
 
 ## 3. 数据流与时序 (Dataflow & Timing)
@@ -119,6 +165,49 @@ d:\soft\FPGA_DNN\
 ├── PE\                  # 计算核心逻辑
 │   ├── Array\           # 32x16 PE 阵列
 │   └── MAC\             # DSP48 MAC 单元
+├── software\            # On-Board 部署软件
+│   ├── uart_sender.py   # PC端: 数据预处理 + UART发送
+│   ├── verify_output.py # PC端: OFM验证 (De-interleave + 比对)
+│   ├── dnn.c            # ARM端: GPIO驱动 + 加速器控制
+│   └── layer1_config.json # 层配置文件
+├── simulator\           # PyTorch 高层模型
+│   ├── sim.py           # 量化卷积/全连接层实现
+│   ├── test.py          # 多层网络测试
+│   └── data\            # 测试数据 (im1-im8)
+├── test\                # RTL 仿真 Testbench
+│   ├── tb_Layer1.sv     # Layer1 硬件仿真
+│   └── tb_common.sv     # 通用仿真任务
 └── docs\                # 文档
-    └── Arch.md          # 本文档
+    ├── Arch.md          # 本文档 (架构设计)
+    └── Implementation.md # 实现细节
 ```
+
+---
+
+## 5. On-Board 部署验证结果
+
+**测试配置**:
+*   层: Conv1 (32×32×1 → 32×32×32, kernel 5×5, stride 1, pad 2)
+*   输入: 真实灰度图像 (`simulator/data/im1/conv1.input.dat`)
+*   Golden Reference: PyTorch 生成 (`conv1.output.dat`)
+
+**数据传输量**:
+*   Weight: 800 bytes → **25,600 bytes** (tile expansion + zero padding)
+*   IFM: 1,024 bytes → **32,768 bytes** (pixel expansion to 32-byte stride)
+*   OFM: **131,072 bytes** (32×32×32 int32 = 128KB, tile-interleaved format)
+
+**验证结果**:
+```
+✓ PERFECT MATCH! FPGA output is identical to golden reference!
+统计数据:
+  Range: [-123, 109]
+  Mean: 1.01, Std: 11.39
+  Non-zero: 9124/32768
+FPGA 输出与 PyTorch 参考模型 100% 匹配 (32,768 个值全部正确)
+```
+
+**关键发现**:
+1. **Weight Tile Organization 必不可少**: 必须将 OIHW 格式转换为 32×16 tile 矩阵，每个 kernel point 512 字节
+2. **IFM Pixel Expansion 必须精确**: 每个像素必须扩展到 32 字节 (8 words)，第一个字节放数据
+3. **OFM 地址偏移**: 硬件输出有 32 元素偏移，验证时需要软件补偿
+4. **De-Interleave 逻辑**: OFM 以 tile-interleaved 格式存储，需转换为 HWC 格式进行验证
