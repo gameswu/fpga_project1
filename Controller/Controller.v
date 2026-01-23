@@ -169,9 +169,12 @@ module controller (
                 S_IDLE: begin
                     cnt_tile_oc <= 0; cnt_tile_ic <= 0;
                     cnt_ky <= 0; cnt_kw <= 0;
-                    done <= 0;
+                    // done保持，直到下一次start时才清零
+                    if (start) begin
+                        busy <= 1;
+                        done <= 0;  // 新的start到来时清除done
+                    end
                     wgt_addr_base <= 0;
-                    if (start) busy <= 1;
                 end
 
                 S_LOAD_WGT: begin
@@ -263,9 +266,9 @@ module controller (
                     
                     // Debug: Print Row 0 data for the first Tile (Tile_OC=0, Tile_IC=0)
                     // This covers all 16 kernel points (KY=0..3, KW=0..3)
-                    if ((cnt_tile_oc == 0) && (cnt_tile_ic == 0)) begin
-                        $display("Time %t: Load Wgt [OC=0, IC=0, KY=%d, KW=%d] Row=%d Data=%h", $time, cnt_ky, cnt_kw, cnt_wgt_row - BRAM_LATENCY, wgt_rdata);
-                    end
+                    // if ((cnt_tile_oc == 0) && (cnt_tile_ic == 0)) begin
+                    //     $display("Time %t: Load Wgt [OC=0, IC=0, KY=%d, KW=%d] Row=%d Data=%h", $time, cnt_ky, cnt_kw, cnt_wgt_row - BRAM_LATENCY, wgt_rdata);
+                    // end
                 end
             end
         end
@@ -279,13 +282,23 @@ module controller (
     reg valid_coord;
     
     always @(*) begin
-        cur_iy = cnt_oy * cfg_stride + cnt_ky - cfg_pad;
-        cur_ix = cnt_ox * cfg_stride + cnt_kw - cfg_pad; // Note: using cnt_kw (kernel x)
+        // Explicit signed conversion to avoid unsigned overflow
+        cur_iy = $signed({1'b0, cnt_oy}) * $signed({1'b0, cfg_stride}) 
+               + $signed({1'b0, cnt_ky}) - $signed({1'b0, cfg_pad});
+        cur_ix = $signed({1'b0, cnt_ox}) * $signed({1'b0, cfg_stride}) 
+               + $signed({1'b0, cnt_kw}) - $signed({1'b0, cfg_pad});
         
-        if (cur_iy >= 0 && cur_iy < cfg_ifm_h && cur_ix >= 0 && cur_ix < cfg_ifm_w)
+        if (cur_iy >= 0 && cur_iy < $signed({1'b0, cfg_ifm_h}) && 
+            cur_ix >= 0 && cur_ix < $signed({1'b0, cfg_ifm_w}))
             valid_coord = 1;
         else
             valid_coord = 0;
+            
+        // Debug boundary check for position (31,31)
+        // if (state == S_COMPUTE && cnt_oy == 31 && cnt_ox == 31 && cnt_tile_oc == 0) begin
+        //     $display("Time %t: [BOUNDARY] Pos(31,31) ky=%0d kw=%0d → iy=%0d ix=%0d valid=%b (H=%0d W=%0d)", 
+        //              $time, cnt_ky, cnt_kw, cur_iy, cur_ix, valid_coord, cfg_ifm_h, cfg_ifm_w);
+        // end
     end
 
     // ------------------------------------------------------
@@ -310,10 +323,12 @@ module controller (
                 if (valid_coord) begin
                     ifm_rd_en <= 1;
                     // Simplified addressing: Row-Major
-                    ifm_addr <= (cur_iy * cfg_ifm_w + cur_ix) * num_tile_ic + cnt_tile_ic;
+                    // Use unsigned versions of cur_iy/cur_ix (safe because valid_coord=1 means non-negative)
+                    ifm_addr <= (cur_iy[15:0] * cfg_ifm_w + cur_ix[15:0]) * num_tile_ic + cnt_tile_ic;
                 end else begin
-                    // Padding: Don't read, inject 0s later
+                    // Padding: Don't read, set address to 0 to avoid spurious reads
                     ifm_rd_en <= 0;
+                    ifm_addr <= 0;
                 end
             end else if (state == S_DRAIN) begin
                 pe_en <= 1; // Keep shifting out results
@@ -330,9 +345,17 @@ module controller (
     // We need to handle the "valid_coord" logic (Padding) here too.
     // Since "valid_coord" was calculated at Addr stage, we need to delay it by 2 cycles.
     
-    reg [1:0] valid_pipe;
-    always @(posedge clk) valid_pipe <= {valid_pipe[0], valid_coord};
-    wire data_valid = valid_pipe[1]; // Aligned with ifm_rdata
+    reg valid_pipe_stage1, valid_pipe_stage2;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            valid_pipe_stage1 <= 0;
+            valid_pipe_stage2 <= 0;
+        end else begin
+            valid_pipe_stage1 <= valid_coord;
+            valid_pipe_stage2 <= valid_pipe_stage1;
+        end
+    end
+    wire data_valid = valid_pipe_stage2; // Aligned with ifm_rdata
 
     genvar i, d;
     generate
@@ -443,7 +466,9 @@ module controller (
             
             first_tile_pipe[0] <= (cnt_tile_ic == 0);
             last_tile_pipe[0]  <= (cnt_tile_ic == num_tile_ic - 1);
+            // first_run: Overwrite mode - first kernel point of each output channel tile
             first_run_pipe[0]  <= (cnt_tile_ic == 0 && cnt_ky == 0 && cnt_kw == 0);
+            // last_run: Finalize mode - last kernel point of each output channel tile  
             last_run_pipe[0]   <= (cnt_tile_ic == num_tile_ic - 1 && cnt_ky == cfg_kh - 1 && cnt_kw == cfg_kw - 1);
             
             // Shift Stages
@@ -486,6 +511,9 @@ module controller (
     // Data for PPU arrives at PIPE_DEPTH - PPU_LATENCY
     wire is_first_run_at_ppu = first_run_pipe[PIPE_DEPTH - PPU_LATENCY];
     wire is_last_run_at_ppu  = last_run_pipe[PIPE_DEPTH - PPU_LATENCY];
+    
+    // Debug: Track accumulation for position (31,31)
+    // wire [31:0] debug_addr_at_ppu = addr_pipe[PIPE_DEPTH - PPUs
     
     ppu #(
         .NUM_CHANNELS(PE_COLS),

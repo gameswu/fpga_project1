@@ -16,6 +16,11 @@ reg cmd_we;
 reg cmd_re;
 wire intr;
 
+// Memory arrays for loading test data
+reg [7:0] ifm_memory [0:65535];  // 64KB for IFM
+reg [7:0] wgt_memory [0:65535];  // 64KB for weights
+reg [7:0] ofm_memory [0:131071]; // 128KB for OFM (int8 format from simulator)
+
 // Clock Generation
 initial begin
     sys_clk = 0;

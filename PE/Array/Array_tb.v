@@ -101,17 +101,18 @@ module Array_tb;
         #20;
 
         // 2. Load Weights
-        // We will load '1' into all PEs to perform a summation test.
-        // Expected Result: If we input a vector of 1s, output should be 32 (32 rows * 1 * 1).
-        $display("Step 1: Loading Weights (All 1s)...");
+        // Load unique weights: PE[row][col] = (row + col + 1)
+        // This ensures each PE has a different weight
+        // For example: Row0: 1,2,3,...,16  Row1: 2,3,4,...,17  Row31: 32,33,...,47
+        $display("Step 1: Loading Weights (Unique per PE: row+col+1)...");
         
-        // Prepare weight data (All 1s for all columns)
-        for (c = 0; c < COLS; c = c + 1) begin
-            weight_in_col[(c+1)*DATA_WIDTH-1 -: DATA_WIDTH] = 8'd1;
-        end
-
         // Enable write for each row sequentially
         for (r = 0; r < ROWS; r = r + 1) begin
+            // Prepare weight data for this specific row
+            for (c = 0; c < COLS; c = c + 1) begin
+                weight_in_col[(c+1)*DATA_WIDTH-1 -: DATA_WIDTH] = (r + c + 1); // Unique per PE
+            end
+            
             @(posedge clk);
             weight_we_row = 0;
             weight_we_row[r] = 1; // Select row r
@@ -122,13 +123,15 @@ module Array_tb;
         $display("Weights Loaded.");
 
         // 3. Run Systolic Computation
-        // We will inject a diagonal wave of '1's.
-        // Row 0 gets '1' at t=0
-        // Row 1 gets '1' at t=1
+        // We will inject a diagonal wave of '5's.
+        // Row 0 gets '5' at t=0
+        // Row 1 gets '5' at t=1
         // ...
-        // Row 31 gets '1' at t=31
+        // Row 31 gets '5' at t=31
+        // Expected: Col0 = sum(row=0..31: (row+0+1)*5) = sum(1..32)*5 = 528*5 = 2640
+        //           Col15 = sum(row=0..31: (row+15+1)*5) = sum(16..47)*5 = 1008*5 = 5040
         
-        $display("Step 2: Injecting Skewed Inputs...");
+        $display("Step 2: Injecting Skewed Inputs (value=5)...");
         @(posedge clk);
         en = 1;
         
@@ -139,7 +142,7 @@ module Array_tb;
             // Update Inputs for this cycle
             for (r = 0; r < ROWS; r = r + 1) begin
                 if (t == r) begin
-                    feature_data_array[r] = 8'd1; // Inject pulse
+                    feature_data_array[r] = 8'd5; // Inject pulse with value 5
                 end else begin
                     feature_data_array[r] = 8'd0;
                 end
@@ -151,16 +154,16 @@ module Array_tb;
             // Monitor Outputs (Delayed check to allow signal stability)
             #1; 
             
-            // Check Column 0 Output
-            if (!col0_passed && psum_out_cols[ACC_WIDTH-1:0] == 32) begin
-                $display("[PASS] Time %t: Col 0 Output matched 32 at cycle t=%d", $time, t);
+            // Check Column 0 Output: sum((1+2+...+32)*5) = 528*5 = 2640
+            if (!col0_passed && psum_out_cols[ACC_WIDTH-1:0] == 2640) begin
+                $display("[PASS] Time %t: Col 0 Output matched 2640 (sum(1..32)*5) at cycle t=%d", $time, t);
                 col0_passed = 1;
             end
 
-            // Check Column 15 Output
+            // Check Column 15 Output: sum((16+17+...+47)*5) = 1008*5 = 5040
             last_col_out = psum_out_cols[COLS*ACC_WIDTH-1 -: ACC_WIDTH];
-            if (!col15_passed && last_col_out == 32) begin
-                $display("[PASS] Time %t: Col 15 Output matched 32 at cycle t=%d", $time, t);
+            if (!col15_passed && last_col_out == 5040) begin
+                $display("[PASS] Time %t: Col 15 Output matched 5040 (sum(16..47)*5) at cycle t=%d", $time, t);
                 col15_passed = 1;
             end
         end
@@ -187,8 +190,8 @@ module Array_tb;
         @(posedge clk);
         en = 1;
         
-        // We will inject a pattern where Row 10 has value 100, others have value 10.
-        // Expected Output: Max(10, 10, ..., 100, ..., 10) = 100.
+        // We will inject a pattern with varying values: Row 0=15, Row 5=23, Row 10=127, Row 20=42, others=18
+        // Expected Output: Max(15, 18, ..., 23, ..., 127, ..., 42, ..., 18) = 127
         // Skewing is still required for the values to align in the column pipeline.
         
         for (integer t = 0; t < 100; t = t + 1) begin
@@ -196,10 +199,16 @@ module Array_tb;
             // Update Inputs
             for (r = 0; r < ROWS; r = r + 1) begin
                 if (t == r) begin
-                    if (r == 10) 
-                        feature_data_array[r] = 8'd100; // Max value at Row 10
+                    if (r == 0) 
+                        feature_data_array[r] = 8'd15;
+                    else if (r == 5)
+                        feature_data_array[r] = 8'd23;
+                    else if (r == 10) 
+                        feature_data_array[r] = 8'd127; // Max value at Row 10
+                    else if (r == 20)
+                        feature_data_array[r] = 8'd42;
                     else 
-                        feature_data_array[r] = 8'd10;  // Other rows
+                        feature_data_array[r] = 8'd18;  // Other rows
                 end else begin
                     feature_data_array[r] = 8'd0;
                 end
@@ -209,21 +218,21 @@ module Array_tb;
             #1; 
             
             // Check Column 0 Output
-            // Expected: 100
-            if (!col0_passed && psum_out_cols[ACC_WIDTH-1:0] == 100) begin
-                $display("[PASS] Time %t: Col 0 Max Output matched 100 at cycle t=%d", $time, t);
+            // Expected: 127
+            if (!col0_passed && psum_out_cols[ACC_WIDTH-1:0] == 127) begin
+                $display("[PASS] Time %t: Col 0 Max Output matched 127 at cycle t=%d", $time, t);
                 col0_passed = 1;
             end
             
-            // Check Column 0 for incorrect Sum (if it was summing, it would be 31*10 + 100 = 410)
-            if (psum_out_cols[ACC_WIDTH-1:0] == 410) begin
-                 $display("[FAIL] Time %t: Col 0 is SUMMING instead of MAX pooling!", $time);
+            // Check Column 0 for incorrect Sum (if it was summing, it would be much larger)
+            if (psum_out_cols[ACC_WIDTH-1:0] > 600) begin
+                 $display("[FAIL] Time %t: Col 0 is SUMMING instead of MAX pooling! Got %d", $time, psum_out_cols[ACC_WIDTH-1:0]);
             end
 
             // Check Column 15 Output
             last_col_out = psum_out_cols[COLS*ACC_WIDTH-1 -: ACC_WIDTH];
-            if (!col15_passed && last_col_out == 100) begin
-                $display("[PASS] Time %t: Col 15 Max Output matched 100 at cycle t=%d", $time, t);
+            if (!col15_passed && last_col_out == 127) begin
+                $display("[PASS] Time %t: Col 15 Max Output matched 127 at cycle t=%d", $time, t);
                 col15_passed = 1;
             end
         end

@@ -120,6 +120,8 @@ module DNN_Wrapper (
     
     wire ifm_sel = (cmd_addr[31:20] == 12'h001);
     wire [15:0] ifm_addra = cmd_addr[17:2]; // 32-bit word address. 0x0010_0000 -> 0. 0x0010_0004 -> 1.
+    // IFM: 32x32x1 = 1024 bytes = 256 words (32-bit). Need 8 bits for word address.
+    // BRAM Port A: 16-bit address for 32-bit words
     
     // Note: DNN_Top outputs 'bram_ifm_addr' which is the 256-bit word index.
     // The IP Port B 'addrb' is [12:0]. 2^13 = 8192. 
@@ -144,6 +146,8 @@ module DNN_Wrapper (
     
     wire wgt_sel = (cmd_addr[31:20] == 12'h002);
     wire [13:0] wgt_addra = cmd_addr[15:2]; // 32-bit word address.
+    // Weight: 32×1×5×5 = 800 bytes = 200 words (32-bit). Need 8 bits for word address.
+    // BRAM Port A: 14-bit address for 32-bit words (sufficient)
     
     wgt_buffer u_wgt_buffer (
       .clka(sys_clk),    // input wire clka
